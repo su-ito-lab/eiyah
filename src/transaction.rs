@@ -227,3 +227,233 @@ fn build_unstow_command(package: &str, home: &Path) -> Command {
 // --------------------------------------------------
 // Tests
 // --------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// 並列test間でtemporary directory名が衝突しないための連番
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// transaction test専用directoryの作成とcleanupを所有するfixture
+    struct TestDirectory {
+        /// fixtureが所有するtemporary directory path
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        /// process IDと連番から衝突しないtest directoryを作成する
+        fn new() -> Result<Self> {
+            for _ in 0..128 {
+                let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let path = env::temp_dir().join(format!(
+                    "eiyah-transaction-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            bail!("failed to allocate transaction test directory");
+        }
+    }
+
+    impl Drop for TestDirectory {
+        /// test成否にかかわらずfixture配下だけを可能な限りcleanupする
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    /// Created actionが作成済みpathを削除することを検証する
+    fn created_action_rolls_back_created_path() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let created = directory.path.join("created");
+        fs::write(&created, b"created")?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Created(created.clone()));
+        transaction.rollback()?;
+
+        assert!(!created.exists());
+        Ok(())
+    }
+
+    #[test]
+    /// Moved actionがmove先を元pathへ復元することを検証する
+    fn moved_action_restores_original_path() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let original = directory.path.join("original");
+        let moved = directory.path.join("moved");
+        fs::write(&original, b"original")?;
+        fs::rename(&original, &moved)?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Moved {
+            from: original.clone(),
+            to: moved.clone(),
+        });
+        transaction.rollback()?;
+
+        assert_eq!(fs::read(&original)?, b"original");
+        assert!(!moved.exists());
+        Ok(())
+    }
+
+    #[test]
+    /// Stowed actionがpackageを明示rootでunstowすることを検証する
+    fn stowed_action_uses_explicit_source_and_target_roots() -> Result<()> {
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Stowed("zsh".to_owned()));
+        let mut packages = Vec::new();
+        transaction.rollback_with(|package| {
+            packages.push(package.to_owned());
+            Ok(())
+        })?;
+        assert_eq!(packages, ["zsh"]);
+
+        let command = build_unstow_command("zsh", Path::new("/home/tester"));
+        let arguments: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(command.get_program(), OsStr::new("stow"));
+        assert_eq!(
+            arguments,
+            [
+                "--delete",
+                "--dir",
+                "/home/tester/.dotfiles",
+                "--target",
+                "/home/tester",
+                "zsh",
+            ]
+            .map(OsString::from)
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// rollbackがActionを記録と逆の順序で処理することを検証する
+    fn rollback_uses_reverse_action_order() -> Result<()> {
+        let mut transaction = Transaction::new();
+        for package in ["first", "second", "third"] {
+            transaction.record(Action::Stowed(package.to_owned()));
+        }
+        let mut packages = Vec::new();
+        transaction.rollback_with(|package| {
+            packages.push(package.to_owned());
+            Ok(())
+        })?;
+
+        assert_eq!(packages, ["third", "second", "first"]);
+        Ok(())
+    }
+
+    #[test]
+    /// 失敗したoperationを記録しなければrollback対象にならないことを検証する
+    fn failed_operation_is_not_recorded() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let missing = directory.path.join("missing");
+        let destination = directory.path.join("destination");
+        let operation = fs::rename(&missing, &destination);
+        assert!(operation.is_err());
+
+        let mut transaction = Transaction::new();
+        transaction.rollback()?;
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[test]
+    /// Moved rollbackが既存の元pathを上書きしないことを検証する
+    fn moved_rollback_rejects_backup_overwrite() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let original = directory.path.join("original");
+        let moved = directory.path.join("moved");
+        fs::write(&original, b"new")?;
+        fs::write(&moved, b"backup")?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Moved {
+            from: original.clone(),
+            to: moved.clone(),
+        });
+        assert!(transaction.rollback().is_err());
+        assert_eq!(fs::read(&original)?, b"new");
+        assert_eq!(fs::read(&moved)?, b"backup");
+        Ok(())
+    }
+
+    #[test]
+    /// atomic renameがdestination競合時に両pathを維持することを検証する
+    fn atomic_rename_rejects_destination_conflict() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source");
+        let destination = directory.path.join("destination");
+        fs::write(&source, b"source")?;
+        fs::write(&destination, b"destination")?;
+
+        assert!(rename_without_replace(&source, &destination).is_err());
+        assert_eq!(fs::read(&source)?, b"source");
+        assert_eq!(fs::read(&destination)?, b"destination");
+        Ok(())
+    }
+
+    #[test]
+    /// rollback失敗後も残りのActionを可能な限りundoすることを検証する
+    fn rollback_continues_after_an_undo_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let created = directory.path.join("created");
+        fs::write(&created, b"created")?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Created(created.clone()));
+        transaction.record(Action::Moved {
+            from: directory.path.join("original"),
+            to: directory.path.join("missing"),
+        });
+        assert!(transaction.rollback().is_err());
+        assert!(!created.exists());
+        Ok(())
+    }
+
+    #[test]
+    /// LockGuardが仕様通りのpathへlock fileを作成することを検証する
+    fn lock_guard_acquires_expected_lock() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let _guard = LockGuard::acquire(&directory.path)?;
+        assert!(directory.path.join("eiyah/lock").is_file());
+        Ok(())
+    }
+
+    #[test]
+    /// 同一lockへの重複したnon-blocking取得を拒否することを検証する
+    fn lock_guard_rejects_duplicate_lock() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let guard = LockGuard::acquire(&directory.path)?;
+        assert!(LockGuard::acquire(&directory.path).is_err());
+        drop(guard);
+        let _reacquired = LockGuard::acquire(&directory.path)?;
+        Ok(())
+    }
+
+    #[test]
+    /// commit後のActionがrollbackされないことを検証する
+    fn committed_action_is_not_rolled_back() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let created = directory.path.join("created");
+        fs::write(&created, b"created")?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Created(created.clone()));
+        transaction.commit();
+        transaction.rollback()?;
+
+        assert!(created.is_file());
+        Ok(())
+    }
+}
