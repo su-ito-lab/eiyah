@@ -9,11 +9,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::transaction::LockGuard;
 
 /// user設定を保存するTOML file名
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -26,6 +28,9 @@ const TEMP_FILE_MODE: u32 = 0o600;
 
 /// process内でtemporary file名の重複を避けるための連番
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// diagnosticsへ表示するPublic repository URL
+const ORIGIN: &str = "https://github.com/su-ito-lab/eiyah";
 
 // --------------------------------------------------
 // Models
@@ -395,6 +400,185 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> Result<(PathBuf, f
         "failed to allocate a unique temporary file in {}",
         parent.display()
     )
+}
+
+// --------------------------------------------------
+// Runtime Configuration
+// --------------------------------------------------
+
+/// runtime diagnosticsへ表示するsystem情報
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemConfig {
+    /// 実行中のPublic Eiyah version
+    pub eiyah_version: String,
+    /// Public Eiyah repository URL
+    pub origin: String,
+    /// install metadataから復元したEiyah prefix
+    pub eiyah_prefix: PathBuf,
+    /// install metadataから復元したconfig path
+    pub eiyah_config: PathBuf,
+    /// user HOME配下のPrivate dotfiles path
+    pub dotfiles: PathBuf,
+    /// install metadataから復元したPixi home
+    pub pixi_home: PathBuf,
+    /// Pixi version output
+    pub pixi: Option<String>,
+    /// Zsh version output
+    pub zsh: Option<String>,
+    /// process environmentのlogin shell
+    pub login_shell: Option<String>,
+    /// Bash version outputの先頭行
+    pub bash: Option<String>,
+    /// Curl version outputの先頭行
+    pub curl: Option<String>,
+    /// os-releaseのPRETTY_NAME
+    pub os: Option<String>,
+    /// host kernel release
+    pub kernel: Option<String>,
+    /// host architecture
+    pub architecture: Option<String>,
+    /// host glibc version
+    pub host_glibc: Option<String>,
+}
+
+/// installed configをexclusive lock内で更新する
+pub fn set_show_cad_status(enabled: bool) -> Result<()> {
+    let paths = load_installed_paths()?;
+    let _lock = LockGuard::acquire(&paths.state_home)?;
+    let mut config = load_config(&paths.eiyah_config)?;
+    config.show_cad_status = enabled;
+    save_config(&paths.eiyah_config, &config)
+}
+
+/// 指定configのshow-cad-status設定を返す
+pub fn is_show_cad_status_enabled(config_path: &Path) -> Result<bool> {
+    Ok(load_config(config_path)?.show_cad_status)
+}
+
+/// installed pathと取得可能なruntime情報を収集する
+pub fn collect_system_config() -> Result<SystemConfig> {
+    let home = runtime_home()?;
+    let paths = load_installed_paths_from_home(&home)?;
+
+    Ok(SystemConfig {
+        eiyah_version: env!("CARGO_PKG_VERSION").to_owned(),
+        origin: ORIGIN.to_owned(),
+        eiyah_prefix: paths.eiyah_prefix.clone(),
+        eiyah_config: paths.eiyah_config.clone(),
+        dotfiles: home.join(".dotfiles"),
+        pixi_home: paths.pixi_home.clone(),
+        pixi: command_first_line(&paths.pixi_home.join("bin/pixi"), &["--version"]),
+        zsh: command_first_line(&paths.pixi_home.join("bin/zsh"), &["--version"]),
+        login_shell: optional_environment_string(env::var_os("SHELL")),
+        bash: command_first_line(Path::new("/usr/bin/bash"), &["--version"]),
+        curl: command_first_line(Path::new("curl"), &["--version"]),
+        os: os_release_value("PRETTY_NAME"),
+        kernel: command_first_line(Path::new("uname"), &["-r"]),
+        architecture: command_first_line(Path::new("uname"), &["-m"]),
+        host_glibc: command_first_line(Path::new("getconf"), &["GNU_LIBC_VERSION"]),
+    })
+}
+
+/// SystemConfigをcontractで定めた順序とsectionへ出力する
+pub fn print_config(config: &SystemConfig) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    print_config_to(&mut output, config)
+}
+
+/// runtime command間でinstalled metadataからpathを復元する
+pub(crate) fn load_installed_paths() -> Result<ResolvedPaths> {
+    let home = runtime_home()?;
+    load_installed_paths_from_home(&home)
+}
+
+/// HOMEを差し替え可能にしてinstalled path discoveryを行う
+pub(crate) fn load_installed_paths_from_home(home: &Path) -> Result<ResolvedPaths> {
+    let public_entry = home.join(".local/bin/eiyah");
+    let metadata_path = discover_install_metadata(&public_entry)?;
+    ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)
+}
+
+/// runtime operationに必要なabsolute HOMEを取得する
+pub(crate) fn runtime_home() -> Result<PathBuf> {
+    required_absolute_environment_path("HOME", env::var_os("HOME"))
+}
+
+/// config表示をtest可能なwriterへ出力する
+fn print_config_to(mut output: impl Write, config: &SystemConfig) -> Result<()> {
+    writeln!(output, "EIYAH_VERSION: {}", config.eiyah_version)?;
+    writeln!(output, "ORIGIN: {}", config.origin)?;
+    writeln!(output, "EIYAH_PREFIX: {}", config.eiyah_prefix.display())?;
+    writeln!(output, "EIYAH_CONFIG: {}", config.eiyah_config.display())?;
+    writeln!(output, "DOTFILES: {}", config.dotfiles.display())?;
+    writeln!(output, "PIXI_HOME: {}", config.pixi_home.display())?;
+    writeln!(output)?;
+    writeln!(output, "Pixi: {}", option_display(&config.pixi))?;
+    writeln!(output, "Zsh: {}", option_display(&config.zsh))?;
+    writeln!(
+        output,
+        "Login shell: {}",
+        option_display(&config.login_shell)
+    )?;
+    writeln!(output, "Bash: {}", option_display(&config.bash))?;
+    writeln!(output, "Curl: {}", option_display(&config.curl))?;
+    writeln!(output)?;
+    writeln!(output, "OS: {}", option_display(&config.os))?;
+    writeln!(output, "Kernel: {}", option_display(&config.kernel))?;
+    writeln!(
+        output,
+        "Architecture: {}",
+        option_display(&config.architecture)
+    )?;
+    writeln!(output, "Host glibc: {}", option_display(&config.host_glibc))?;
+    Ok(())
+}
+
+/// optional runtime valueをN/A fallback付きで表示する
+fn option_display(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("N/A")
+}
+
+/// emptyまたはnon-UTF environment値を取得不能として扱う
+fn optional_environment_string(value: Option<OsString>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.into_string().ok())
+}
+
+/// external command成功時のstdout先頭行だけを取得する
+fn command_first_line(executable: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new(executable).args(arguments).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// os-releaseから指定fieldのquoteを除いた値を取得する
+pub(crate) fn os_release_value(name: &str) -> Option<String> {
+    let contents = fs::read_to_string("/etc/os-release").ok()?;
+    parse_os_release_value(&contents, name)
+}
+
+/// os-release textから指定fieldを抽出する
+fn parse_os_release_value(contents: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let value = contents
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))?;
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 // --------------------------------------------------
