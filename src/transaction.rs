@@ -35,14 +35,14 @@ pub enum Action {
 /// 成功済みoperationをrollbackまで逆順に保持するtransaction
 #[derive(Debug, Default)]
 pub struct Transaction {
-    /// rollback対象となる成功済みaction
+    // rollback対象となる成功済みaction
     actions: Vec<Action>,
 }
 
 /// operation全体の重複実行を防ぐexclusive lock
 #[derive(Debug)]
 pub struct LockGuard {
-    /// lockの生存期間中にflockを保持するfile handle
+    // lockの生存期間中にflockを保持するfile handle
     file: fs::File,
 }
 
@@ -67,7 +67,7 @@ impl Transaction {
         self.rollback_with(unstow_package)
     }
 
-    /// Stow解除処理を差し替え可能にして全actionのundoを継続する
+    // Stow解除処理を差し替え可能にして全actionのundoを継続する
     fn rollback_with(&mut self, mut unstow: impl FnMut(&str) -> Result<()>) -> Result<()> {
         // 失敗後も残りのundoを継続するため、各errorを最後まで保持する
         let mut errors = Vec::new();
@@ -127,7 +127,7 @@ impl LockGuard {
 }
 
 impl Drop for LockGuard {
-    /// guard終了時に明示的にlockを解放する
+    // guard終了時に明示的にlockを解放する
     fn drop(&mut self) {
         // SAFETY: file descriptorはDrop完了までLockGuardが所有する
         unsafe {
@@ -136,7 +136,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// Action variantごとのfilesystemまたはStow変更を取り消す
+// Action variantごとのfilesystemまたはStow変更を取り消す
 fn undo(action: Action, unstow: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
     match action {
         Action::Created(path) => remove_created_path(&path),
@@ -145,7 +145,7 @@ fn undo(action: Action, unstow: &mut impl FnMut(&str) -> Result<()>) -> Result<(
     }
 }
 
-/// 作成済みpathをfile typeに応じて削除する
+// 作成済みpathをfile typeに応じて削除する
 fn remove_created_path(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -161,12 +161,12 @@ fn remove_created_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// move先を元pathへ戻し、既存の元pathは上書きしない
+// move先を元pathへ戻し、既存の元pathは上書きしない
 fn restore_moved_path(from: &Path, to: &Path) -> Result<()> {
     rename_without_replace(to, from)
 }
 
-/// destinationの存在確認とmoveをatomicに行い上書きを拒否する
+// destinationの存在確認とmoveをatomicに行い上書きを拒否する
 fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
     let source = CString::new(source.as_os_str().as_bytes())
         .map_err(|_| anyhow!("source path contains a NUL byte"))?;
@@ -189,7 +189,7 @@ fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stow済みpackageを固定したsource / target rootから解除する
+// Stow済みpackageを固定したsource / target rootから解除する
 fn unstow_package(package: &str) -> Result<()> {
     // working directoryへ依存しないStow targetの基準path
     let home = env::var_os("HOME")
@@ -209,7 +209,7 @@ fn unstow_package(package: &str) -> Result<()> {
     Ok(())
 }
 
-/// working directory非依存のStow delete commandを構成する
+// working directory非依存のStow delete commandを構成する
 fn build_unstow_command(package: &str, home: &Path) -> Command {
     // install済みPrivate dotfilesを保持するStow source root
     let source_root = home.join(".dotfiles");
@@ -235,17 +235,17 @@ mod tests {
 
     use super::*;
 
-    /// 並列test間でtemporary directory名が衝突しないための連番
+    // 並列test間でtemporary directory名が衝突しないための連番
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// transaction test専用directoryの作成とcleanupを所有するfixture
+    // transaction test専用directoryの作成とcleanupを所有するfixture
     struct TestDirectory {
-        /// fixtureが所有するtemporary directory path
+        // fixtureが所有するtemporary directory path
         path: PathBuf,
     }
 
     impl TestDirectory {
-        /// process IDと連番から衝突しないtest directoryを作成する
+        // process IDと連番から衝突しないtest directoryを作成する
         fn new() -> Result<Self> {
             for _ in 0..128 {
                 let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -264,14 +264,14 @@ mod tests {
     }
 
     impl Drop for TestDirectory {
-        /// test成否にかかわらずfixture配下だけを可能な限りcleanupする
+        // test成否にかかわらずfixture配下だけを可能な限りcleanupする
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
 
     #[test]
-    /// Created actionが作成済みpathを削除することを検証する
+    // Created actionが作成済みpathを削除することを検証する
     fn created_action_rolls_back_created_path() -> Result<()> {
         let directory = TestDirectory::new()?;
         let created = directory.path.join("created");
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    /// Moved actionがmove先を元pathへ復元することを検証する
+    // Moved actionがmove先を元pathへ復元することを検証する
     fn moved_action_restores_original_path() -> Result<()> {
         let directory = TestDirectory::new()?;
         let original = directory.path.join("original");
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    /// Stowed actionがpackageを明示rootでunstowすることを検証する
+    // Stowed actionがpackageを明示rootでunstowすることを検証する
     fn stowed_action_uses_explicit_source_and_target_roots() -> Result<()> {
         let mut transaction = Transaction::new();
         transaction.record(Action::Stowed("zsh".to_owned()));
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    /// rollbackがActionを記録と逆の順序で処理することを検証する
+    // rollbackがActionを記録と逆の順序で処理することを検証する
     fn rollback_uses_reverse_action_order() -> Result<()> {
         let mut transaction = Transaction::new();
         for package in ["first", "second", "third"] {
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    /// 失敗したoperationを記録しなければrollback対象にならないことを検証する
+    // 失敗したoperationを記録しなければrollback対象にならないことを検証する
     fn failed_operation_is_not_recorded() -> Result<()> {
         let directory = TestDirectory::new()?;
         let missing = directory.path.join("missing");
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    /// Moved rollbackが既存の元pathを上書きしないことを検証する
+    // Moved rollbackが既存の元pathを上書きしないことを検証する
     fn moved_rollback_rejects_backup_overwrite() -> Result<()> {
         let directory = TestDirectory::new()?;
         let original = directory.path.join("original");
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    /// atomic renameがdestination競合時に両pathを維持することを検証する
+    // atomic renameがdestination競合時に両pathを維持することを検証する
     fn atomic_rename_rejects_destination_conflict() -> Result<()> {
         let directory = TestDirectory::new()?;
         let source = directory.path.join("source");
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    /// rollback失敗後も残りのActionを可能な限りundoすることを検証する
+    // rollback失敗後も残りのActionを可能な限りundoすることを検証する
     fn rollback_continues_after_an_undo_failure() -> Result<()> {
         let directory = TestDirectory::new()?;
         let created = directory.path.join("created");
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    /// LockGuardが仕様通りのpathへlock fileを作成することを検証する
+    // LockGuardが仕様通りのpathへlock fileを作成することを検証する
     fn lock_guard_acquires_expected_lock() -> Result<()> {
         let directory = TestDirectory::new()?;
         let _guard = LockGuard::acquire(&directory.path)?;
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    /// 同一lockへの重複したnon-blocking取得を拒否することを検証する
+    // 同一lockへの重複したnon-blocking取得を拒否することを検証する
     fn lock_guard_rejects_duplicate_lock() -> Result<()> {
         let directory = TestDirectory::new()?;
         let guard = LockGuard::acquire(&directory.path)?;
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    /// commit後のActionがrollbackされないことを検証する
+    // commit後のActionがrollbackされないことを検証する
     fn committed_action_is_not_rolled_back() -> Result<()> {
         let directory = TestDirectory::new()?;
         let created = directory.path.join("created");

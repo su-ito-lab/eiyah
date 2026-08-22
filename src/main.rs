@@ -28,46 +28,46 @@ use config::{
 };
 use handoff::{run_handoff, run_show_cad_status_enabled};
 
-/// runtime branchで実行可能なPublic / Internal CLI
+// runtime branchで実行可能なPublic / Internal CLI
 #[derive(Debug, Parser)]
 #[command(name = "eiyah", version)]
 struct Cli {
-    /// 実行するEiyah command
+    // 実行するEiyah command
     #[command(subcommand)]
     command: Command,
 }
 
-/// runtime branchが本実装を持つcommand
+// runtime branchが本実装を持つcommand
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Eiyahとsystem configurationを表示する
+    // Eiyahとsystem configurationを表示する
     Config,
-    /// Eiyah installationを診断する
+    // Eiyah installationを診断する
     Doctor,
-    /// CAD status表示または表示設定を操作する
+    // CAD status表示または表示設定を操作する
     ShowCadStatus {
-        /// show-cad-status設定の変更action
+        // show-cad-status設定の変更action
         #[command(subcommand)]
         action: Option<ShowCadStatusAction>,
     },
-    /// tcshからZshへ移行するか問い合わせるinternal command
+    // tcshからZshへ移行するか問い合わせるinternal command
     #[command(name = "__handoff", hide = true)]
     Handoff,
-    /// show-cad-status設定をexit statusで返すinternal command
+    // show-cad-status設定をexit statusで返すinternal command
     #[command(name = "__show-cad-status-enabled", hide = true)]
     ShowCadStatusEnabled,
 }
 
-/// show-cad-status設定へ適用するaction
+// show-cad-status設定へ適用するaction
 #[derive(Debug, Subcommand)]
 enum ShowCadStatusAction {
-    /// shell handoff前のstatus表示を有効化する
+    // shell handoff前のstatus表示を有効化する
     Enable,
-    /// shell handoff前のstatus表示を無効化する
+    // shell handoff前のstatus表示を無効化する
     Disable,
 }
 
-/// CLI errorを表示してcontractに対応するexit statusへ変換する
+// CLI errorを表示してcontractに対応するexit statusへ変換する
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(code),
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Current Branchで実装済みのcommandだけをdispatchする
+// Current Branchで実装済みのcommandだけをdispatchする
 fn run(cli: Cli) -> Result<u8> {
     run_with(
         cli,
@@ -89,7 +89,7 @@ fn run(cli: Cli) -> Result<u8> {
     )
 }
 
-/// runtime dependencyを差し替え可能にしてCLI dispatchを実行する
+// runtime dependencyを差し替え可能にしてCLI dispatchを実行する
 fn run_with(
     cli: Cli,
     mut handoff: impl FnMut() -> Result<bool>,
@@ -135,7 +135,7 @@ fn run_with(
     }
 }
 
-/// Public show-cad-status entryを継承streamで実行する
+// Public show-cad-status entryを継承streamで実行する
 fn run_show_cad_status() -> Result<u8> {
     let executable = runtime_home()?.join(".local/bin/show-cad-status");
     let status = ProcessCommand::new(&executable)
@@ -144,7 +144,7 @@ fn run_show_cad_status() -> Result<u8> {
     child_exit_status(status)
 }
 
-/// child process statusをPublic CLIのexit statusへ変換する
+// child process statusをPublic CLIのexit statusへ変換する
 fn child_exit_status(status: std::process::ExitStatus) -> Result<u8> {
     match status.code() {
         Some(code) if (0..=u8::MAX as i32).contains(&code) => Ok(code as u8),
@@ -153,7 +153,7 @@ fn child_exit_status(status: std::process::ExitStatus) -> Result<u8> {
     }
 }
 
-/// 全診断項目を収集しWarningまたはsuccess messageを表示する
+// 全診断項目を収集しWarningまたはsuccess messageを表示する
 fn run_doctor() -> Result<bool> {
     let mut issues = Vec::new();
     let home = match runtime_home() {
@@ -187,7 +187,7 @@ fn run_doctor() -> Result<bool> {
     }
 }
 
-/// HOMEだけで判定可能なdotfiles directoryを診断する
+// HOMEだけで判定可能なdotfiles directoryを診断する
 fn diagnose_dotfiles(home: &Path, issues: &mut Vec<String>) {
     let dotfiles = home.join(".dotfiles");
     if !dotfiles.is_dir() {
@@ -198,7 +198,7 @@ fn diagnose_dotfiles(home: &Path, issues: &mut Vec<String>) {
     }
 }
 
-/// 復元済みpathへ依存するmanaged artifactを診断する
+// 復元済みpathへ依存するmanaged artifactを診断する
 fn diagnose_installed_paths(home: &Path, paths: &config::ResolvedPaths, issues: &mut Vec<String>) {
     let binary = paths.eiyah_prefix.join("bin/eiyah");
     if !is_executable(&binary) {
@@ -230,7 +230,7 @@ fn diagnose_installed_paths(home: &Path, paths: &config::ResolvedPaths, issues: 
     }
 }
 
-/// Public Eiyah entryがinstalled binaryを直接指すことを診断する
+// Public Eiyah entryがinstalled binaryを直接指すことを診断する
 fn diagnose_eiyah_symlink(home: &Path, binary: &Path, issues: &mut Vec<String>) {
     let public_entry = home.join(".local/bin/eiyah");
     if !is_expected_symlink(&public_entry, binary) {
@@ -238,7 +238,7 @@ fn diagnose_eiyah_symlink(home: &Path, binary: &Path, issues: &mut Vec<String>) 
     }
 }
 
-/// configured login shellがcsh / tcsh familyであることを診断する
+// configured login shellがcsh / tcsh familyであることを診断する
 fn diagnose_login_shell(issues: &mut Vec<String>) {
     let shell = env::var_os("SHELL").map(PathBuf::from);
     let valid = shell
@@ -251,7 +251,7 @@ fn diagnose_login_shell(issues: &mut Vec<String>) {
     }
 }
 
-/// OS / architecture / glibcのhost compatibilityを診断する
+// OS / architecture / glibcのhost compatibilityを診断する
 fn diagnose_host_compatibility(issues: &mut Vec<String>) {
     let os_compatible = os_release_value("ID").as_deref() == Some("almalinux")
         && os_release_value("VERSION_ID")
@@ -271,21 +271,21 @@ fn diagnose_host_compatibility(issues: &mut Vec<String>) {
     }
 }
 
-/// executable pathがregular fileかつexecute bit付きか確認する
+// executable pathがregular fileかつexecute bit付きか確認する
 fn is_executable(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
-/// symlinkがexpected absolute targetを直接指すことを確認する
+// symlinkがexpected absolute targetを直接指すことを確認する
 fn is_expected_symlink(path: &Path, expected: &Path) -> bool {
     fs::read_link(path)
         .map(|target| target.is_absolute() && target == expected)
         .unwrap_or(false)
 }
 
-/// command成功時のstdout先頭行を取得する
+// command成功時のstdout先頭行を取得する
 fn command_line(executable: &str, arguments: &[&str]) -> Option<String> {
     let output = ProcessCommand::new(executable)
         .args(arguments)
@@ -303,13 +303,13 @@ fn command_line(executable: &str, arguments: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// major.minor versionを数値tupleへ変換する
+// major.minor versionを数値tupleへ変換する
 fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
     let mut fields = value.split('.');
     Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
-/// stderrのTTY / NO_COLOR契約に従ってWarningを表示する
+// stderrのTTY / NO_COLOR契約に従ってWarningを表示する
 fn print_warning(message: &str) {
     if io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() {
         eprintln!("\x1b[33mWarning:\x1b[0m {message}");
@@ -318,7 +318,7 @@ fn print_warning(message: &str) {
     }
 }
 
-/// stderrのTTY / NO_COLOR契約に従ってErrorを表示する
+// stderrのTTY / NO_COLOR契約に従ってErrorを表示する
 fn print_error(message: &str) {
     if io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() {
         eprintln!("\x1b[31mError:\x1b[0m {message}");
@@ -342,7 +342,7 @@ mod tests {
     use super::*;
 
     #[test]
-    /// runtime branch所属のPublic / Internal commandをparseできることを検証する
+    // runtime branch所属のPublic / Internal commandをparseできることを検証する
     fn parses_runtime_commands() {
         for arguments in [
             vec!["eiyah", "config"],
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    /// Planned Branch commandをruntime parserへ含めないことを検証する
+    // Planned Branch commandをruntime parserへ含めないことを検証する
     fn rejects_planned_branch_commands() {
         for command in ["update", "__install", "__uninstall"] {
             assert!(Cli::try_parse_from(["eiyah", command]).is_err());
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    /// internal commandをhelp表示から隠すことを検証する
+    // internal commandをhelp表示から隠すことを検証する
     fn hides_internal_commands_from_help() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("__handoff"));
@@ -374,14 +374,14 @@ mod tests {
     }
 
     #[test]
-    /// glibc compatibility判定用のmajor.minor parseを検証する
+    // glibc compatibility判定用のmajor.minor parseを検証する
     fn parses_major_minor_version() {
         assert_eq!(parse_major_minor("2.28"), Some((2, 28)));
         assert_eq!(parse_major_minor("invalid"), None);
     }
 
     #[test]
-    /// Eiyah public symlinkのtarget不一致をdoctor issueへ集約することを検証する
+    // Eiyah public symlinkのtarget不一致をdoctor issueへ集約することを検証する
     fn diagnoses_mismatched_eiyah_symlink() -> Result<()> {
         let home =
             std::env::temp_dir().join(format!("eiyah-doctor-symlink-test-{}", std::process::id()));
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    /// internal protocolとdoctorのCLI exit status mappingを検証する
+    // internal protocolとdoctorのCLI exit status mappingを検証する
     fn maps_runtime_dispatch_exit_statuses() -> Result<()> {
         for (command, result, expected) in [
             ("__handoff", Ok(true), 0),
@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    /// actionなしshow-cad-statusがchild exit statusをそのまま返すことを検証する
+    // actionなしshow-cad-statusがchild exit statusをそのまま返すことを検証する
     fn propagates_show_cad_status_child_exit_status() -> Result<()> {
         let child_status = std::process::ExitStatus::from_raw(37 << 8);
         assert_eq!(child_exit_status(child_status)?, 37);

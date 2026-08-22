@@ -85,7 +85,7 @@ pub fn detect_install_state(paths: &ResolvedPaths, public_entry: &Path) -> Resul
     Ok(InstallState::Installed)
 }
 
-/// symlinkを追跡せずpath entryの存在を確認する
+// symlinkを追跡せずpath entryの存在を確認する
 fn path_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -94,13 +94,13 @@ fn path_exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// regular fileにいずれかのexecute bitがあることを確認する
+// regular fileにいずれかのexecute bitがあることを確認する
 fn is_executable(path: &Path) -> Result<bool> {
     let metadata = fs::metadata(path)?;
     Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-/// state不整合として扱えるpublic entryのfilesystem errorを分類する
+// state不整合として扱えるpublic entryのfilesystem errorを分類する
 fn is_structural_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -108,7 +108,7 @@ fn is_structural_error(error: &io::Error) -> bool {
     )
 }
 
-/// parse / validation errorと状態変化をPartialへ分類する
+// parse / validation errorと状態変化をPartialへ分類する
 fn is_structural_failure(error: &Error) -> bool {
     error
         .downcast_ref::<io::Error>()
@@ -129,17 +129,17 @@ mod tests {
 
     use super::*;
 
-    /// 並列test間でtemporary directory名が衝突しないための連番
+    // 並列test間でtemporary directory名が衝突しないための連番
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// install state test専用directoryを所有するfixture
+    // install state test専用directoryを所有するfixture
     struct TestDirectory {
-        /// fixtureが所有するtemporary directory path
+        // fixtureが所有するtemporary directory path
         path: PathBuf,
     }
 
     impl TestDirectory {
-        /// process IDと連番からtest directoryを作成する
+        // process IDと連番からtest directoryを作成する
         fn new() -> Result<Self> {
             let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
@@ -152,13 +152,13 @@ mod tests {
     }
 
     impl Drop for TestDirectory {
-        /// test終了時にfixture配下だけをcleanupする
+        // test終了時にfixture配下だけをcleanupする
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
 
-    /// fixture配下に閉じたexpected pathを構成する
+    // fixture配下に閉じたexpected pathを構成する
     fn fixture_paths(root: &Path) -> Result<ResolvedPaths> {
         ResolvedPaths::from_install_metadata(InstallMetadata {
             config_home: root.join("config"),
@@ -168,7 +168,7 @@ mod tests {
         })
     }
 
-    /// Installed判定に必要なbinary / entry / metadataを作成する
+    // Installed判定に必要なbinary / entry / metadataを作成する
     fn create_installed_fixture(paths: &ResolvedPaths, public_entry: &Path) -> Result<()> {
         let binary = paths.eiyah_prefix.join("bin/eiyah");
         fs::create_dir_all(binary.parent().unwrap())?;
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    /// managed artifactがすべてない場合にNotInstalledとなることを検証する
+    // managed artifactがすべてない場合にNotInstalledとなることを検証する
     fn detects_not_installed_state() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    /// 整合するartifact一式をInstalledとして判定することを検証する
+    // 整合するartifact一式をInstalledとして判定することを検証する
     fn detects_installed_state() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    /// artifactが一部だけ存在する場合にPartialとなることを検証する
+    // artifactが一部だけ存在する場合にPartialとなることを検証する
     fn detects_partial_state() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    /// install.toml pathが非regular fileの場合にPartialとなることを検証する
+    // install.toml pathが非regular fileの場合にPartialとなることを検証する
     fn detects_non_regular_metadata_as_partial() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    /// broken / wrong public symlinkをPartialとして扱うことを検証する
+    // broken / wrong public symlinkをPartialとして扱うことを検証する
     fn detects_invalid_public_symlinks_as_partial() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    /// invalid metadataとmetadata由来prefix不一致をPartialとして扱うことを検証する
+    // invalid metadataとmetadata由来prefix不一致をPartialとして扱うことを検証する
     fn detects_invalid_or_mismatched_metadata_as_partial() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = fixture_paths(&directory.path)?;

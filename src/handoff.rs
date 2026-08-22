@@ -23,7 +23,7 @@ pub fn run_show_cad_status_enabled() -> Result<bool> {
     run_show_cad_status_enabled_from(&paths.eiyah_config)
 }
 
-/// handoff promptのIOを差し替えてYes / No protocolを処理する
+// handoff promptのIOを差し替えてYes / No protocolを処理する
 fn run_handoff_with(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
     loop {
         write!(output, "Switch to Zsh? [Y/n] ")?;
@@ -41,7 +41,7 @@ fn run_handoff_with(input: &mut impl BufRead, output: &mut impl Write) -> Result
     }
 }
 
-/// config pathを差し替えてinternal status protocolを評価する
+// config pathを差し替えてinternal status protocolを評価する
 fn run_show_cad_status_enabled_from(config_path: &Path) -> Result<bool> {
     is_show_cad_status_enabled(config_path)
 }
@@ -61,25 +61,25 @@ mod tests {
 
     use super::*;
 
-    /// 並列test間でconfig pathが衝突しないための連番
+    // 並列test間でconfig pathが衝突しないための連番
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// write errorをhandoffへ返すtest writer
+    // write errorをhandoffへ返すtest writer
     struct FailingWriter;
 
     impl Write for FailingWriter {
-        /// prompt writeを常に失敗させる
+        // prompt writeを常に失敗させる
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
             Err(Error::new(ErrorKind::BrokenPipe, "test write failure"))
         }
 
-        /// test writerはbufferを持たないため成功扱いにする
+        // test writerはbufferを持たないため成功扱いにする
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    /// test専用config pathを作成する
+    // test専用config pathを作成する
     fn config_path() -> PathBuf {
         let sequence = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    /// EnterとASCIIの全accepted inputを検証する
+    // EnterとASCIIの全accepted inputを検証する
     fn accepts_all_ascii_yes_and_no_inputs() -> Result<()> {
         for (input, expected) in [
             ("\n", true),
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    /// 日本語・全角入力をinvalidとして扱いUTF-8 errorなしで再試行することを検証する
+    // 日本語・全角入力をinvalidとして扱いUTF-8 errorなしで再試行することを検証する
     fn retries_japanese_and_full_width_input() -> Result<()> {
         let mut output = Vec::new();
         assert!(run_handoff_with(
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    /// invalid input後にpromptを再試行することを検証する
+    // invalid input後にpromptを再試行することを検証する
     fn retries_invalid_input() -> Result<()> {
         let mut output = Vec::new();
         assert!(!run_handoff_with(
@@ -148,13 +148,13 @@ mod tests {
     }
 
     #[test]
-    /// promptのIO errorをprotocol errorとして返すことを検証する
+    // promptのIO errorをprotocol errorとして返すことを検証する
     fn reports_io_error() {
         assert!(run_handoff_with(&mut Cursor::new("yes\n"), &mut FailingWriter).is_err());
     }
 
     #[test]
-    /// configのenabled / disabledとparse errorを検証する
+    // configのenabled / disabledとparse errorを検証する
     fn reports_show_cad_status_config_state() -> Result<()> {
         let path = config_path();
         save_config(

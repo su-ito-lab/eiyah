@@ -17,19 +17,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::transaction::LockGuard;
 
-/// user設定を保存するTOML file名
+// user設定を保存するTOML file名
 const CONFIG_FILE_NAME: &str = "config.toml";
-/// 各XDG base directory配下で使用するapplication directory名
+// 各XDG base directory配下で使用するapplication directory名
 const EIYAH_DIRECTORY_NAME: &str = "eiyah";
-/// install後の配置情報を保存するTOML file名
+// install後の配置情報を保存するTOML file名
 const INSTALL_METADATA_FILE_NAME: &str = "install.toml";
-/// atomic saveのtemporary fileへ設定するpermission
+// atomic saveのtemporary fileへ設定するpermission
 const TEMP_FILE_MODE: u32 = 0o600;
 
-/// process内でtemporary file名の重複を避けるための連番
+// process内でtemporary file名の重複を避けるための連番
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// diagnosticsへ表示するPublic repository URL
+// diagnosticsへ表示するPublic repository URL
 const ORIGIN: &str = "https://github.com/su-ito-lab/eiyah";
 
 // --------------------------------------------------
@@ -67,7 +67,7 @@ impl ResolvedPaths {
         ))
     }
 
-    /// 検証済みのXDG base pathへEiyah固有のrelative pathを付加する
+    // 検証済みのXDG base pathへEiyah固有のrelative pathを付加する
     fn from_homes(
         config_home: PathBuf,
         data_home: PathBuf,
@@ -118,7 +118,7 @@ pub struct InstallMetadata {
 }
 
 impl InstallMetadata {
-    /// metadataの全pathが空でないabsolute pathであることを保証する
+    // metadataの全pathが空でないabsolute pathであることを保証する
     fn validate(&self) -> Result<()> {
         validate_absolute_path("config-home", &self.config_home)?;
         validate_absolute_path("data-home", &self.data_home)?;
@@ -129,7 +129,7 @@ impl InstallMetadata {
 }
 
 impl From<&ResolvedPaths> for InstallMetadata {
-    /// derived pathを除外し、正本となる4つのXDG base pathだけを抽出する
+    // derived pathを除外し、正本となる4つのXDG base pathだけを抽出する
     fn from(paths: &ResolvedPaths) -> Self {
         Self {
             config_home: paths.config_home.clone(),
@@ -149,7 +149,7 @@ pub fn resolve_paths() -> Result<ResolvedPaths> {
     resolve_paths_from(|name| env::var_os(name))
 }
 
-/// environment取得元を差し替え可能にしてXDG fallback規則を一元化する
+// environment取得元を差し替え可能にしてXDG fallback規則を一元化する
 fn resolve_paths_from(
     mut get_environment: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<ResolvedPaths> {
@@ -188,7 +188,7 @@ fn resolve_paths_from(
     ))
 }
 
-/// fallbackできない必須environment pathへ共通の絶対path制約を適用する
+// fallbackできない必須environment pathへ共通の絶対path制約を適用する
 fn required_absolute_environment_path(name: &str, value: Option<OsString>) -> Result<PathBuf> {
     let value = value.with_context(|| format!("{name} is not set"))?;
     let path = PathBuf::from(value);
@@ -196,7 +196,7 @@ fn required_absolute_environment_path(name: &str, value: Option<OsString>) -> Re
     Ok(path)
 }
 
-/// XDG値が未設定または空の場合だけHOME配下のfallbackを選択する
+// XDG値が未設定または空の場合だけHOME配下のfallbackを選択する
 fn xdg_path(name: &str, value: Option<OsString>, home: &Path, fallback: &str) -> Result<PathBuf> {
     match value {
         None => Ok(home.join(fallback)),
@@ -209,7 +209,7 @@ fn xdg_path(name: &str, value: Option<OsString>, home: &Path, fallback: &str) ->
     }
 }
 
-/// filesystem操作がcurrent directoryへ依存しないようpath制約を検証する
+// filesystem操作がcurrent directoryへ依存しないようpath制約を検証する
 fn validate_absolute_path(name: &str, path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         bail!("{name} must not be empty");
@@ -268,14 +268,14 @@ pub fn discover_install_metadata(public_entry_point: &Path) -> Result<PathBuf> {
 // TOML Storage
 // --------------------------------------------------
 
-/// user設定fileを読み、厳格なschemaでConfigへ変換する
+/// user設定fileを読み、厳格なschemaで`Config`へ変換する
 pub fn load_config(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
     toml::from_str(&contents).with_context(|| format!("failed to parse config: {}", path.display()))
 }
 
-/// ConfigをTOML化し、既存fileを安全にatomic replacementする
+/// `Config`をTOML化し、既存fileを安全にatomic replacementする
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     let contents = toml::to_string(config).context("failed to serialize config")?;
     atomic_save(path, contents.as_bytes())
@@ -303,7 +303,7 @@ pub fn save_install_metadata(paths: &ResolvedPaths) -> Result<()> {
     )
 }
 
-/// 同一directoryのtemporary fileを介して、通常fileだけをatomic置換する
+// 同一directoryのtemporary fileを介して、通常fileだけをatomic置換する
 fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
     validate_replace_target(target)?;
 
@@ -357,7 +357,7 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
     result
 }
 
-/// symlink追跡を避け、missingまたは通常fileだけを置換対象として許可する
+// symlink追跡を避け、missingまたは通常fileだけを置換対象として許可する
 fn validate_replace_target(target: &Path) -> Result<()> {
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
@@ -371,7 +371,7 @@ fn validate_replace_target(target: &Path) -> Result<()> {
     }
 }
 
-/// create_newで衝突を検出しながら同一directoryへtemporary fileを確保する
+// create_newで衝突を検出しながら同一directoryへtemporary fileを確保する
 fn create_temporary_file(parent: &Path, file_name: &OsStr) -> Result<(PathBuf, fs::File)> {
     for _ in 0..128 {
         let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -447,7 +447,7 @@ pub fn set_show_cad_status(enabled: bool) -> Result<()> {
     set_show_cad_status_from_home(&home, enabled)
 }
 
-/// HOMEを差し替え可能にしてinstalled configを更新する
+// HOMEを差し替え可能にしてinstalled configを更新する
 fn set_show_cad_status_from_home(home: &Path, enabled: bool) -> Result<()> {
     let paths = load_installed_paths_from_home(home)?;
     let _lock = LockGuard::acquire(&paths.state_home)?;
@@ -485,7 +485,7 @@ pub fn collect_system_config() -> Result<SystemConfig> {
     })
 }
 
-/// SystemConfigをcontractで定めた順序とsectionへ出力する
+/// [SystemConfig]をcontractで定めた順序とsectionへ出力する
 pub fn print_config(config: &SystemConfig) -> Result<()> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -498,19 +498,19 @@ pub(crate) fn load_installed_paths() -> Result<ResolvedPaths> {
     load_installed_paths_from_home(&home)
 }
 
-/// HOMEを差し替え可能にしてinstalled path discoveryを行う
+/// `HOME`を差し替え可能にしてinstalled path discoveryを行う
 pub(crate) fn load_installed_paths_from_home(home: &Path) -> Result<ResolvedPaths> {
     let public_entry = home.join(".local/bin/eiyah");
     let metadata_path = discover_install_metadata(&public_entry)?;
     ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)
 }
 
-/// runtime operationに必要なabsolute HOMEを取得する
+/// runtime operationに必要なabsolute `HOME`を取得する
 pub(crate) fn runtime_home() -> Result<PathBuf> {
     required_absolute_environment_path("HOME", env::var_os("HOME"))
 }
 
-/// config表示をtest可能なwriterへ出力する
+// config表示をtest可能なwriterへ出力する
 fn print_config_to(mut output: impl Write, config: &SystemConfig) -> Result<()> {
     writeln!(output, "EIYAH_VERSION: {}", config.eiyah_version)?;
     writeln!(output, "ORIGIN: {}", config.origin)?;
@@ -540,19 +540,19 @@ fn print_config_to(mut output: impl Write, config: &SystemConfig) -> Result<()> 
     Ok(())
 }
 
-/// optional runtime valueをN/A fallback付きで表示する
+// optional runtime valueをN/A fallback付きで表示する
 fn option_display(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("N/A")
 }
 
-/// emptyまたはnon-UTF environment値を取得不能として扱う
+// emptyまたはnon-UTF environment値を取得不能として扱う
 fn optional_environment_string(value: Option<OsString>) -> Option<String> {
     value
         .filter(|value| !value.is_empty())
         .and_then(|value| value.into_string().ok())
 }
 
-/// external command成功時のstdout先頭行だけを取得する
+// external command成功時のstdout先頭行だけを取得する
 fn command_first_line(executable: &Path, arguments: &[&str]) -> Option<String> {
     let output = Command::new(executable).args(arguments).output().ok()?;
     if !output.status.success() {
@@ -567,13 +567,13 @@ fn command_first_line(executable: &Path, arguments: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// os-releaseから指定fieldのquoteを除いた値を取得する
+/// `os-release`から指定fieldのquoteを除いた値を取得する
 pub(crate) fn os_release_value(name: &str) -> Option<String> {
     let contents = fs::read_to_string("/etc/os-release").ok()?;
     parse_os_release_value(&contents, name)
 }
 
-/// os-release textから指定fieldを抽出する
+// os-release textから指定fieldを抽出する
 fn parse_os_release_value(contents: &str, name: &str) -> Option<String> {
     let prefix = format!("{name}=");
     let value = contents
@@ -605,17 +605,17 @@ mod tests {
 
     use super::*;
 
-    /// 並列test間でtemporary directory名が衝突しないための連番
+    // 並列test間でtemporary directory名が衝突しないための連番
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// 各test専用directoryの作成とcleanupを所有するfixture
+    // 各test専用directoryの作成とcleanupを所有するfixture
     struct TestDirectory {
-        /// fixtureが所有するtemporary directory path
+        // fixtureが所有するtemporary directory path
         path: PathBuf,
     }
 
     impl TestDirectory {
-        /// process IDと連番から衝突しないtest directoryを作成する
+        // process IDと連番から衝突しないtest directoryを作成する
         fn new() -> Result<Self> {
             let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path =
@@ -626,13 +626,13 @@ mod tests {
     }
 
     impl Drop for TestDirectory {
-        /// test成否にかかわらずfixture配下だけを可能な限りcleanupする
+        // test成否にかかわらずfixture配下だけを可能な限りcleanupする
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
 
-    /// process environmentを変更せずに任意のenvironment値でpath解決を検証する
+    // process environmentを変更せずに任意のenvironment値でpath解決を検証する
     fn resolve_with(values: &[(&str, &str)]) -> Result<ResolvedPaths> {
         let values: HashMap<&str, OsString> = values
             .iter()
@@ -641,7 +641,7 @@ mod tests {
         resolve_paths_from(|name| values.get(name).cloned())
     }
 
-    /// atomic save test用に全XDG base pathをfixture配下へ閉じ込める
+    // atomic save test用に全XDG base pathをfixture配下へ閉じ込める
     fn paths_under(root: &Path) -> ResolvedPaths {
         ResolvedPaths::from_homes(
             root.join("config"),
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    /// XDG未設定時にHOME配下の規定pathが選ばれることを検証する
+    // XDG未設定時にHOME配下の規定pathが選ばれることを検証する
     fn resolve_paths_uses_xdg_fallbacks() -> Result<()> {
         let paths = resolve_with(&[("HOME", "/home/tester")])?;
         assert_eq!(paths.config_home, Path::new("/home/tester/.config"));
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    /// 空のXDG値を未設定と同様に扱うことを検証する
+    // 空のXDG値を未設定と同様に扱うことを検証する
     fn resolve_paths_treats_empty_xdg_values_as_unset() -> Result<()> {
         let paths = resolve_with(&[
             ("HOME", "/home/tester"),
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    /// environment pathを不必要にUTF-8へ変換しないことを検証する
+    // environment pathを不必要にUTF-8へ変換しないことを検証する
     fn resolve_paths_preserves_non_utf8_environment_paths() -> Result<()> {
         let data_home = OsString::from_vec(b"/xdg/data-\xff".to_vec());
         let paths = resolve_paths_from(|name| match name {
@@ -706,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    /// absolute XDG値がfallbackより優先されることを検証する
+    // absolute XDG値がfallbackより優先されることを検証する
     fn resolve_paths_uses_absolute_xdg_values() -> Result<()> {
         let paths = resolve_with(&[
             ("HOME", "/home/tester"),
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    /// HOMEとXDGへ適用する必須・absolute path制約を検証する
+    // HOMEとXDGへ適用する必須・absolute path制約を検証する
     fn resolve_paths_rejects_invalid_home_and_xdg_values() {
         assert!(resolve_with(&[]).is_err());
         assert!(resolve_with(&[("HOME", "")]).is_err());
@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    /// metadataのbase pathからderived pathが正しく復元されることを検証する
+    // metadataのbase pathからderived pathが正しく復元されることを検証する
     fn install_metadata_converts_to_resolved_paths() -> Result<()> {
         let metadata = InstallMetadata {
             config_home: PathBuf::from("/xdg/config"),
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    /// targetの存在に依存せず正常・broken symlinkを探索できることを検証する
+    // targetの存在に依存せず正常・broken symlinkを探索できることを検証する
     fn discover_install_metadata_accepts_normal_and_broken_symlinks() -> Result<()> {
         let directory = TestDirectory::new()?;
         let prefix = directory.path.join("prefix");
@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    /// metadata discoveryが不正なpublic entry pointを拒否することを検証する
+    // metadata discoveryが不正なpublic entry pointを拒否することを検証する
     fn discover_install_metadata_rejects_invalid_entry_points() -> Result<()> {
         let directory = TestDirectory::new()?;
         let missing = directory.path.join("missing");
@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    /// Configのbool値がdefaultなしで往復できることを検証する
+    // Configのbool値がdefaultなしで往復できることを検証する
     fn config_round_trips_true_and_false() -> Result<()> {
         for value in [true, false] {
             let config = Config {
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    /// Configがschema外または不完全なTOMLを拒否することを検証する
+    // Configがschema外または不完全なTOMLを拒否することを検証する
     fn config_rejects_missing_unknown_duplicate_and_malformed_fields() {
         assert!(toml::from_str::<Config>("").is_err());
         assert!(toml::from_str::<Config>("show-cad-status = true\nunknown = 1\n").is_err());
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    /// InstallMetadataの厳格なschemaとabsolute path制約を検証する
+    // InstallMetadataの厳格なschemaとabsolute path制約を検証する
     fn install_metadata_rejects_invalid_toml_and_paths() {
         let valid = concat!(
             "config-home = \"/config\"\n",
@@ -855,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    /// load_install_metadataがempty / relative pathを拒否することを検証する
+    // load_install_metadataがempty / relative pathを拒否することを検証する
     fn load_install_metadata_rejects_empty_and_relative_paths() -> Result<()> {
         let directory = TestDirectory::new()?;
         // empty pathを含むmetadataのload結果を直接確認するためのfixture
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    /// load APIがmissing fileをerrorとして返すことを検証する
+    // load APIがmissing fileをerrorとして返すことを検証する
     fn load_functions_report_missing_files() {
         let missing = Path::new("/definitely/missing/eiyah-config.toml");
         assert!(load_config(missing).is_err());
@@ -896,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    /// atomic saveの作成・置換と0600 permissionを検証する
+    // atomic saveの作成・置換と0600 permissionを検証する
     fn atomic_save_creates_and_replaces_regular_files_with_mode_0600() -> Result<()> {
         let directory = TestDirectory::new()?;
         let config_path = directory.path.join("config.toml");
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    /// atomic saveが危険なtargetとparent未作成を拒否することを検証する
+    // atomic saveが危険なtargetとparent未作成を拒否することを検証する
     fn atomic_save_rejects_symlinks_directories_and_missing_parents() -> Result<()> {
         let directory = TestDirectory::new()?;
         let regular = directory.path.join("regular");
@@ -965,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    /// install metadataが4つのbase pathだけを保存することを検証する
+    // install metadataが4つのbase pathだけを保存することを検証する
     fn install_metadata_saves_only_the_four_home_paths() -> Result<()> {
         let directory = TestDirectory::new()?;
         let paths = paths_under(&directory.path);
@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    /// SystemConfigを所定のlabel・順序・空行で表示することを検証する
+    // SystemConfigを所定のlabel・順序・空行で表示することを検証する
     fn system_config_uses_canonical_output_format() -> Result<()> {
         let config = SystemConfig {
             eiyah_version: "1.2.3".to_owned(),
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    /// os-releaseからquote付きPRETTY_NAMEを取得することを検証する
+    // os-releaseからquote付きPRETTY_NAMEを取得することを検証する
     fn parses_os_release_pretty_name() {
         let contents = "ID=almalinux\nPRETTY_NAME=\"AlmaLinux 8.10\"\n";
         assert_eq!(
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    /// empty SHELLを取得不能runtimeとしてN/A表示することを検証する
+    // empty SHELLを取得不能runtimeとしてN/A表示することを検証する
     fn treats_empty_login_shell_as_unavailable() {
         let login_shell = optional_environment_string(Some(OsString::new()));
         assert_eq!(login_shell, None);
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    /// metadata由来pathとLockGuardを使用してshow-cad-status設定を更新することを検証する
+    // metadata由来pathとLockGuardを使用してshow-cad-status設定を更新することを検証する
     fn updates_show_cad_status_through_installed_metadata_and_lock() -> Result<()> {
         let directory = TestDirectory::new()?;
         let home = directory.path.join("home");
