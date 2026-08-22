@@ -80,13 +80,30 @@ fn main() -> ExitCode {
 
 /// Current Branchで実装済みのcommandだけをdispatchする
 fn run(cli: Cli) -> Result<u8> {
+    run_with(
+        cli,
+        run_handoff,
+        run_show_cad_status_enabled,
+        run_doctor,
+        run_show_cad_status,
+    )
+}
+
+/// runtime dependencyを差し替え可能にしてCLI dispatchを実行する
+fn run_with(
+    cli: Cli,
+    mut handoff: impl FnMut() -> Result<bool>,
+    mut show_cad_status_enabled: impl FnMut() -> Result<bool>,
+    mut doctor: impl FnMut() -> Result<bool>,
+    mut show_cad_status: impl FnMut() -> Result<u8>,
+) -> Result<u8> {
     match cli.command {
         Command::Config => {
             print_config(&collect_system_config()?)?;
             Ok(0)
         }
-        Command::Doctor => Ok(if run_doctor()? { 0 } else { 1 }),
-        Command::ShowCadStatus { action: None } => run_show_cad_status(),
+        Command::Doctor => Ok(if doctor()? { 0 } else { 1 }),
+        Command::ShowCadStatus { action: None } => show_cad_status(),
         Command::ShowCadStatus {
             action: Some(ShowCadStatusAction::Enable),
         } => {
@@ -99,7 +116,7 @@ fn run(cli: Cli) -> Result<u8> {
             set_show_cad_status(false)?;
             Ok(0)
         }
-        Command::Handoff => match run_handoff() {
+        Command::Handoff => match handoff() {
             Ok(true) => Ok(0),
             Ok(false) => Ok(1),
             Err(error) => {
@@ -107,7 +124,7 @@ fn run(cli: Cli) -> Result<u8> {
                 Ok(2)
             }
         },
-        Command::ShowCadStatusEnabled => match run_show_cad_status_enabled() {
+        Command::ShowCadStatusEnabled => match show_cad_status_enabled() {
             Ok(true) => Ok(0),
             Ok(false) => Ok(1),
             Err(error) => {
@@ -124,6 +141,11 @@ fn run_show_cad_status() -> Result<u8> {
     let status = ProcessCommand::new(&executable)
         .status()
         .with_context(|| format!("failed to execute {}", executable.display()))?;
+    child_exit_status(status)
+}
+
+/// child process statusをPublic CLIのexit statusへ変換する
+fn child_exit_status(status: std::process::ExitStatus) -> Result<u8> {
     match status.code() {
         Some(code) if (0..=u8::MAX as i32).contains(&code) => Ok(code as u8),
         Some(code) => bail!("show-cad-status returned unsupported exit status {code}"),
@@ -313,6 +335,7 @@ fn print_error(message: &str) {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::ExitStatusExt;
 
     use clap::CommandFactory;
 
@@ -372,6 +395,67 @@ mod tests {
 
         assert_eq!(issues, ["Eiyah public symlink is invalid"]);
         fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[test]
+    /// internal protocolとdoctorのCLI exit status mappingを検証する
+    fn maps_runtime_dispatch_exit_statuses() -> Result<()> {
+        for (command, result, expected) in [
+            ("__handoff", Ok(true), 0),
+            ("__handoff", Ok(false), 1),
+            ("__handoff", Err(anyhow::anyhow!("handoff error")), 2),
+            ("__show-cad-status-enabled", Ok(true), 0),
+            ("__show-cad-status-enabled", Ok(false), 1),
+            (
+                "__show-cad-status-enabled",
+                Err(anyhow::anyhow!("config error")),
+                2,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["eiyah", command])?;
+            let mut result = Some(result);
+            let status = if command == "__handoff" {
+                run_with(
+                    cli,
+                    || result.take().unwrap(),
+                    || Ok(false),
+                    || Ok(false),
+                    || Ok(0),
+                )?
+            } else {
+                run_with(
+                    cli,
+                    || Ok(false),
+                    || result.take().unwrap(),
+                    || Ok(false),
+                    || Ok(0),
+                )?
+            };
+            assert_eq!(status, expected);
+        }
+
+        for (healthy, expected) in [(true, 0), (false, 1)] {
+            let cli = Cli::try_parse_from(["eiyah", "doctor"])?;
+            assert_eq!(
+                run_with(cli, || Ok(false), || Ok(false), || Ok(healthy), || Ok(0),)?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// actionなしshow-cad-statusがchild exit statusをそのまま返すことを検証する
+    fn propagates_show_cad_status_child_exit_status() -> Result<()> {
+        let child_status = std::process::ExitStatus::from_raw(37 << 8);
+        assert_eq!(child_exit_status(child_status)?, 37);
+
+        let cli = Cli::try_parse_from(["eiyah", "show-cad-status"])?;
+        assert_eq!(
+            run_with(cli, || Ok(false), || Ok(false), || Ok(false), || Ok(37),)?,
+            37
+        );
         Ok(())
     }
 }

@@ -443,7 +443,13 @@ pub struct SystemConfig {
 
 /// installed configをexclusive lock内で更新する
 pub fn set_show_cad_status(enabled: bool) -> Result<()> {
-    let paths = load_installed_paths()?;
+    let home = runtime_home()?;
+    set_show_cad_status_from_home(&home, enabled)
+}
+
+/// HOMEを差し替え可能にしてinstalled configを更新する
+fn set_show_cad_status_from_home(home: &Path, enabled: bool) -> Result<()> {
+    let paths = load_installed_paths_from_home(home)?;
     let _lock = LockGuard::acquire(&paths.state_home)?;
     let mut config = load_config(&paths.eiyah_config)?;
     config.show_cad_status = enabled;
@@ -1041,5 +1047,44 @@ mod tests {
         let login_shell = optional_environment_string(Some(OsString::new()));
         assert_eq!(login_shell, None);
         assert_eq!(option_display(&login_shell), "N/A");
+    }
+
+    #[test]
+    /// metadata由来pathとLockGuardを使用してshow-cad-status設定を更新することを検証する
+    fn updates_show_cad_status_through_installed_metadata_and_lock() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let paths = paths_under(&directory.path.join("metadata-xdg"));
+        let binary = paths.eiyah_prefix.join("bin/eiyah");
+        let public_entry = home.join(".local/bin/eiyah");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        fs::create_dir_all(public_entry.parent().unwrap())?;
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+        symlink(&binary, &public_entry)?;
+        save_install_metadata(&paths)?;
+        save_config(
+            &paths.eiyah_config,
+            &Config {
+                show_cad_status: false,
+            },
+        )?;
+
+        let fallback_config = home.join(".config/eiyah/config.toml");
+        fs::create_dir_all(fallback_config.parent().unwrap())?;
+        save_config(
+            &fallback_config,
+            &Config {
+                show_cad_status: false,
+            },
+        )?;
+
+        set_show_cad_status_from_home(&home, true)?;
+        assert!(load_config(&paths.eiyah_config)?.show_cad_status);
+        assert!(!load_config(&fallback_config)?.show_cad_status);
+
+        let _lock = LockGuard::acquire(&paths.state_home)?;
+        assert!(set_show_cad_status_from_home(&home, false).is_err());
+        assert!(load_config(&paths.eiyah_config)?.show_cad_status);
+        Ok(())
     }
 }
