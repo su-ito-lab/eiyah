@@ -976,4 +976,70 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    /// SystemConfigを所定のlabel・順序・空行で表示することを検証する
+    fn system_config_uses_canonical_output_format() -> Result<()> {
+        let config = SystemConfig {
+            eiyah_version: "1.2.3".to_owned(),
+            origin: "https://example.invalid/eiyah".to_owned(),
+            eiyah_prefix: PathBuf::from("/data/eiyah"),
+            eiyah_config: PathBuf::from("/config/eiyah/config.toml"),
+            dotfiles: PathBuf::from("/home/tester/.dotfiles"),
+            pixi_home: PathBuf::from("/data/eiyah/pixi"),
+            pixi: Some("pixi 1".to_owned()),
+            zsh: None,
+            login_shell: Some("/bin/tcsh".to_owned()),
+            bash: Some("GNU bash".to_owned()),
+            curl: Some("curl 1".to_owned()),
+            os: Some("AlmaLinux 8".to_owned()),
+            kernel: Some("kernel".to_owned()),
+            architecture: Some("x86_64".to_owned()),
+            host_glibc: Some("glibc 2.28".to_owned()),
+        };
+        let mut output = Vec::new();
+        print_config_to(&mut output, &config)?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            concat!(
+                "EIYAH_VERSION: 1.2.3\n",
+                "ORIGIN: https://example.invalid/eiyah\n",
+                "EIYAH_PREFIX: /data/eiyah\n",
+                "EIYAH_CONFIG: /config/eiyah/config.toml\n",
+                "DOTFILES: /home/tester/.dotfiles\n",
+                "PIXI_HOME: /data/eiyah/pixi\n",
+                "\n",
+                "Pixi: pixi 1\n",
+                "Zsh: N/A\n",
+                "Login shell: /bin/tcsh\n",
+                "Bash: GNU bash\n",
+                "Curl: curl 1\n",
+                "\n",
+                "OS: AlmaLinux 8\n",
+                "Kernel: kernel\n",
+                "Architecture: x86_64\n",
+                "Host glibc: glibc 2.28\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// os-releaseからquote付きPRETTY_NAMEを取得することを検証する
+    fn parses_os_release_pretty_name() {
+        let contents = "ID=almalinux\nPRETTY_NAME=\"AlmaLinux 8.10\"\n";
+        assert_eq!(
+            parse_os_release_value(contents, "PRETTY_NAME").as_deref(),
+            Some("AlmaLinux 8.10")
+        );
+        assert_eq!(parse_os_release_value(contents, "MISSING"), None);
+    }
+
+    #[test]
+    /// empty SHELLを取得不能runtimeとしてN/A表示することを検証する
+    fn treats_empty_login_shell_as_unavailable() {
+        let login_shell = optional_environment_string(Some(OsString::new()));
+        assert_eq!(login_shell, None);
+        assert_eq!(option_display(&login_shell), "N/A");
+    }
 }

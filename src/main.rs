@@ -308,3 +308,70 @@ fn print_error(message: &str) {
 // --------------------------------------------------
 // Tests
 // --------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    /// runtime branch所属のPublic / Internal commandをparseできることを検証する
+    fn parses_runtime_commands() {
+        for arguments in [
+            vec!["eiyah", "config"],
+            vec!["eiyah", "doctor"],
+            vec!["eiyah", "show-cad-status"],
+            vec!["eiyah", "show-cad-status", "enable"],
+            vec!["eiyah", "show-cad-status", "disable"],
+            vec!["eiyah", "__handoff"],
+            vec!["eiyah", "__show-cad-status-enabled"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+    }
+
+    #[test]
+    /// Planned Branch commandをruntime parserへ含めないことを検証する
+    fn rejects_planned_branch_commands() {
+        for command in ["update", "__install", "__uninstall"] {
+            assert!(Cli::try_parse_from(["eiyah", command]).is_err());
+        }
+    }
+
+    #[test]
+    /// internal commandをhelp表示から隠すことを検証する
+    fn hides_internal_commands_from_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("__handoff"));
+        assert!(!help.contains("__show-cad-status-enabled"));
+    }
+
+    #[test]
+    /// glibc compatibility判定用のmajor.minor parseを検証する
+    fn parses_major_minor_version() {
+        assert_eq!(parse_major_minor("2.28"), Some((2, 28)));
+        assert_eq!(parse_major_minor("invalid"), None);
+    }
+
+    #[test]
+    /// Eiyah public symlinkのtarget不一致をdoctor issueへ集約することを検証する
+    fn diagnoses_mismatched_eiyah_symlink() -> Result<()> {
+        let home =
+            std::env::temp_dir().join(format!("eiyah-doctor-symlink-test-{}", std::process::id()));
+        let public_entry = home.join(".local/bin/eiyah");
+        let expected = home.join("data/eiyah/bin/eiyah");
+        fs::create_dir_all(public_entry.parent().unwrap())?;
+        symlink(home.join("other/bin/eiyah"), &public_entry)?;
+
+        let mut issues = Vec::new();
+        diagnose_eiyah_symlink(&home, &expected, &mut issues);
+
+        assert_eq!(issues, ["Eiyah public symlink is invalid"]);
+        fs::remove_dir_all(home)?;
+        Ok(())
+    }
+}
