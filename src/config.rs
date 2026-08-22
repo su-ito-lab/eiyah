@@ -400,3 +400,396 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> Result<(PathBuf, f
 // --------------------------------------------------
 // Tests
 // --------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use anyhow::Result;
+
+    use super::*;
+
+    /// 並列test間でtemporary directory名が衝突しないための連番
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// 各test専用directoryの作成とcleanupを所有するfixture
+    struct TestDirectory {
+        /// fixtureが所有するtemporary directory path
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        /// process IDと連番から衝突しないtest directoryを作成する
+        fn new() -> Result<Self> {
+            let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                env::temp_dir().join(format!("eiyah-config-test-{}-{sequence}", process::id()));
+            fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestDirectory {
+        /// test成否にかかわらずfixture配下だけを可能な限りcleanupする
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// process environmentを変更せずに任意のenvironment値でpath解決を検証する
+    fn resolve_with(values: &[(&str, &str)]) -> Result<ResolvedPaths> {
+        let values: HashMap<&str, OsString> = values
+            .iter()
+            .map(|(name, value)| (*name, OsString::from(value)))
+            .collect();
+        resolve_paths_from(|name| values.get(name).cloned())
+    }
+
+    /// atomic save test用に全XDG base pathをfixture配下へ閉じ込める
+    fn paths_under(root: &Path) -> ResolvedPaths {
+        ResolvedPaths::from_homes(
+            root.join("config"),
+            root.join("data"),
+            root.join("state"),
+            root.join("cache"),
+        )
+    }
+
+    #[test]
+    /// XDG未設定時にHOME配下の規定pathが選ばれることを検証する
+    fn resolve_paths_uses_xdg_fallbacks() -> Result<()> {
+        let paths = resolve_with(&[("HOME", "/home/tester")])?;
+        assert_eq!(paths.config_home, Path::new("/home/tester/.config"));
+        assert_eq!(paths.data_home, Path::new("/home/tester/.local/share"));
+        assert_eq!(paths.state_home, Path::new("/home/tester/.local/state"));
+        assert_eq!(paths.cache_home, Path::new("/home/tester/.cache"));
+        assert_eq!(
+            paths.eiyah_prefix,
+            Path::new("/home/tester/.local/share/eiyah")
+        );
+        assert_eq!(
+            paths.eiyah_config,
+            Path::new("/home/tester/.config/eiyah/config.toml")
+        );
+        assert_eq!(
+            paths.pixi_home,
+            Path::new("/home/tester/.local/share/eiyah/pixi")
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// 空のXDG値を未設定と同様に扱うことを検証する
+    fn resolve_paths_treats_empty_xdg_values_as_unset() -> Result<()> {
+        let paths = resolve_with(&[
+            ("HOME", "/home/tester"),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_DATA_HOME", ""),
+            ("XDG_STATE_HOME", ""),
+            ("XDG_CACHE_HOME", ""),
+        ])?;
+        assert_eq!(paths.config_home, Path::new("/home/tester/.config"));
+        assert_eq!(paths.data_home, Path::new("/home/tester/.local/share"));
+        assert_eq!(paths.state_home, Path::new("/home/tester/.local/state"));
+        assert_eq!(paths.cache_home, Path::new("/home/tester/.cache"));
+        Ok(())
+    }
+
+    #[test]
+    /// environment pathを不必要にUTF-8へ変換しないことを検証する
+    fn resolve_paths_preserves_non_utf8_environment_paths() -> Result<()> {
+        let data_home = OsString::from_vec(b"/xdg/data-\xff".to_vec());
+        let paths = resolve_paths_from(|name| match name {
+            "HOME" => Some(OsString::from("/home/tester")),
+            "XDG_DATA_HOME" => Some(data_home.clone()),
+            _ => None,
+        })?;
+        assert_eq!(paths.data_home.as_os_str(), data_home);
+        assert_eq!(paths.eiyah_prefix, PathBuf::from(data_home).join("eiyah"));
+        Ok(())
+    }
+
+    #[test]
+    /// absolute XDG値がfallbackより優先されることを検証する
+    fn resolve_paths_uses_absolute_xdg_values() -> Result<()> {
+        let paths = resolve_with(&[
+            ("HOME", "/home/tester"),
+            ("XDG_CONFIG_HOME", "/xdg/config"),
+            ("XDG_DATA_HOME", "/xdg/data"),
+            ("XDG_STATE_HOME", "/xdg/state"),
+            ("XDG_CACHE_HOME", "/xdg/cache"),
+        ])?;
+        assert_eq!(paths.config_home, Path::new("/xdg/config"));
+        assert_eq!(paths.data_home, Path::new("/xdg/data"));
+        assert_eq!(paths.state_home, Path::new("/xdg/state"));
+        assert_eq!(paths.cache_home, Path::new("/xdg/cache"));
+        Ok(())
+    }
+
+    #[test]
+    /// HOMEとXDGへ適用する必須・absolute path制約を検証する
+    fn resolve_paths_rejects_invalid_home_and_xdg_values() {
+        assert!(resolve_with(&[]).is_err());
+        assert!(resolve_with(&[("HOME", "")]).is_err());
+        assert!(resolve_with(&[("HOME", "relative")]).is_err());
+        assert!(resolve_with(&[("HOME", "/home/tester"), ("XDG_DATA_HOME", "relative")]).is_err());
+    }
+
+    #[test]
+    /// metadataのbase pathからderived pathが正しく復元されることを検証する
+    fn install_metadata_converts_to_resolved_paths() -> Result<()> {
+        let metadata = InstallMetadata {
+            config_home: PathBuf::from("/xdg/config"),
+            data_home: PathBuf::from("/xdg/data"),
+            state_home: PathBuf::from("/xdg/state"),
+            cache_home: PathBuf::from("/xdg/cache"),
+        };
+        let paths = ResolvedPaths::from_install_metadata(metadata)?;
+        assert_eq!(paths.eiyah_prefix, Path::new("/xdg/data/eiyah"));
+        assert_eq!(
+            paths.eiyah_config,
+            Path::new("/xdg/config/eiyah/config.toml")
+        );
+        assert_eq!(paths.pixi_home, Path::new("/xdg/data/eiyah/pixi"));
+        Ok(())
+    }
+
+    #[test]
+    /// targetの存在に依存せず正常・broken symlinkを探索できることを検証する
+    fn discover_install_metadata_accepts_normal_and_broken_symlinks() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let prefix = directory.path.join("prefix");
+        let target = prefix.join("bin/eiyah");
+        let normal_entry = directory.path.join("normal-eiyah");
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(&target, b"binary")?;
+        symlink(&target, &normal_entry)?;
+        assert_eq!(
+            discover_install_metadata(&normal_entry)?,
+            prefix.join("install.toml")
+        );
+
+        let broken_target = directory.path.join("broken-prefix/bin/eiyah");
+        let broken_entry = directory.path.join("broken-eiyah");
+        symlink(&broken_target, &broken_entry)?;
+        assert_eq!(
+            discover_install_metadata(&broken_entry)?,
+            directory.path.join("broken-prefix/install.toml")
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// metadata discoveryが不正なpublic entry pointを拒否することを検証する
+    fn discover_install_metadata_rejects_invalid_entry_points() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let missing = directory.path.join("missing");
+        assert!(discover_install_metadata(&missing).is_err());
+
+        let regular = directory.path.join("regular");
+        fs::write(&regular, b"not a symlink")?;
+        assert!(discover_install_metadata(&regular).is_err());
+
+        let relative = directory.path.join("relative");
+        symlink("prefix/bin/eiyah", &relative)?;
+        assert!(discover_install_metadata(&relative).is_err());
+
+        let wrong_shape = directory.path.join("wrong-shape");
+        symlink(directory.path.join("prefix/eiyah"), &wrong_shape)?;
+        assert!(discover_install_metadata(&wrong_shape).is_err());
+        Ok(())
+    }
+
+    #[test]
+    /// Configのbool値がdefaultなしで往復できることを検証する
+    fn config_round_trips_true_and_false() -> Result<()> {
+        for value in [true, false] {
+            let config = Config {
+                show_cad_status: value,
+            };
+            let serialized = toml::to_string(&config)?;
+            assert_eq!(toml::from_str::<Config>(&serialized)?, config);
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Configがschema外または不完全なTOMLを拒否することを検証する
+    fn config_rejects_missing_unknown_duplicate_and_malformed_fields() {
+        assert!(toml::from_str::<Config>("").is_err());
+        assert!(toml::from_str::<Config>("show-cad-status = true\nunknown = 1\n").is_err());
+        assert!(
+            toml::from_str::<Config>("show-cad-status = true\nshow-cad-status = false\n").is_err()
+        );
+        assert!(toml::from_str::<Config>("show-cad-status = [\n").is_err());
+    }
+
+    #[test]
+    /// InstallMetadataの厳格なschemaとabsolute path制約を検証する
+    fn install_metadata_rejects_invalid_toml_and_paths() {
+        let valid = concat!(
+            "config-home = \"/config\"\n",
+            "data-home = \"/data\"\n",
+            "state-home = \"/state\"\n",
+            "cache-home = \"/cache\"\n",
+        );
+        assert!(toml::from_str::<InstallMetadata>(valid).is_ok());
+        assert!(toml::from_str::<InstallMetadata>(&format!("{valid}unknown = 1\n")).is_err());
+        assert!(toml::from_str::<InstallMetadata>("config-home = \"/config\"\n").is_err());
+        assert!(
+            toml::from_str::<InstallMetadata>(&format!("{valid}config-home = \"/other-config\"\n"))
+                .is_err()
+        );
+
+        let relative = InstallMetadata {
+            config_home: PathBuf::from("relative"),
+            data_home: PathBuf::from("/data"),
+            state_home: PathBuf::from("/state"),
+            cache_home: PathBuf::from("/cache"),
+        };
+        assert!(ResolvedPaths::from_install_metadata(relative).is_err());
+
+        let empty = InstallMetadata {
+            config_home: PathBuf::new(),
+            data_home: PathBuf::from("/data"),
+            state_home: PathBuf::from("/state"),
+            cache_home: PathBuf::from("/cache"),
+        };
+        assert!(ResolvedPaths::from_install_metadata(empty).is_err());
+    }
+
+    #[test]
+    /// load_install_metadataがempty / relative pathを拒否することを検証する
+    fn load_install_metadata_rejects_empty_and_relative_paths() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        // empty pathを含むmetadataのload結果を直接確認するためのfixture
+        let empty_path = directory.path.join("empty.toml");
+        fs::write(
+            &empty_path,
+            concat!(
+                "config-home = \"\"\n",
+                "data-home = \"/data\"\n",
+                "state-home = \"/state\"\n",
+                "cache-home = \"/cache\"\n",
+            ),
+        )?;
+        assert!(load_install_metadata(&empty_path).is_err());
+
+        // relative pathを含むmetadataのload結果を直接確認するためのfixture
+        let relative_path = directory.path.join("relative.toml");
+        fs::write(
+            &relative_path,
+            concat!(
+                "config-home = \"/config\"\n",
+                "data-home = \"relative\"\n",
+                "state-home = \"/state\"\n",
+                "cache-home = \"/cache\"\n",
+            ),
+        )?;
+        assert!(load_install_metadata(&relative_path).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    /// load APIがmissing fileをerrorとして返すことを検証する
+    fn load_functions_report_missing_files() {
+        let missing = Path::new("/definitely/missing/eiyah-config.toml");
+        assert!(load_config(missing).is_err());
+        assert!(load_install_metadata(missing).is_err());
+    }
+
+    #[test]
+    /// atomic saveの作成・置換と0600 permissionを検証する
+    fn atomic_save_creates_and_replaces_regular_files_with_mode_0600() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let config_path = directory.path.join("config.toml");
+        save_config(
+            &config_path,
+            &Config {
+                show_cad_status: true,
+            },
+        )?;
+        assert_eq!(
+            fs::metadata(&config_path)?.permissions().mode() & 0o777,
+            TEMP_FILE_MODE
+        );
+        assert_eq!(load_config(&config_path)?.show_cad_status, true);
+
+        save_config(
+            &config_path,
+            &Config {
+                show_cad_status: false,
+            },
+        )?;
+        assert_eq!(load_config(&config_path)?.show_cad_status, false);
+        Ok(())
+    }
+
+    #[test]
+    /// atomic saveが危険なtargetとparent未作成を拒否することを検証する
+    fn atomic_save_rejects_symlinks_directories_and_missing_parents() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let regular = directory.path.join("regular");
+        fs::write(&regular, b"content")?;
+        let symlink_path = directory.path.join("config.toml");
+        symlink(&regular, &symlink_path)?;
+        assert!(
+            save_config(
+                &symlink_path,
+                &Config {
+                    show_cad_status: true,
+                }
+            )
+            .is_err()
+        );
+
+        let directory_target = directory.path.join("directory-target");
+        fs::create_dir(&directory_target)?;
+        assert!(
+            save_config(
+                &directory_target,
+                &Config {
+                    show_cad_status: true,
+                }
+            )
+            .is_err()
+        );
+
+        assert!(
+            save_config(
+                &directory.path.join("missing/config.toml"),
+                &Config {
+                    show_cad_status: true,
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// install metadataが4つのbase pathだけを保存することを検証する
+    fn install_metadata_saves_only_the_four_home_paths() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        save_install_metadata(&paths)?;
+
+        let metadata_path = paths.eiyah_prefix.join("install.toml");
+        let contents = fs::read_to_string(&metadata_path)?;
+        assert_eq!(contents.lines().count(), 4);
+        assert!(!contents.contains("version"));
+        assert_eq!(
+            load_install_metadata(&metadata_path)?,
+            InstallMetadata::from(&paths)
+        );
+        Ok(())
+    }
+}
