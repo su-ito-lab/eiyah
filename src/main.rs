@@ -351,9 +351,10 @@ mod tests {
     use super::*;
 
     #[test]
-    // runtime branch所属のPublic / Internal commandをparseできることを検証する
-    fn parses_runtime_commands() {
+    // 実装済みのPublic / Internal commandをparseできることを検証する
+    fn parses_commands() {
         for arguments in [
+            vec!["eiyah", "update"],
             vec!["eiyah", "config"],
             vec!["eiyah", "doctor"],
             vec!["eiyah", "show-cad-status"],
@@ -367,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    // Planned Branch commandをruntime parserへ含めないことを検証する
+    // Planned Branch commandをparserへ含めないことを検証する
     fn rejects_planned_branch_commands() {
-        for command in ["update", "__install", "__uninstall"] {
+        for command in ["__install", "__uninstall"] {
             assert!(Cli::try_parse_from(["eiyah", command]).is_err());
         }
     }
@@ -427,6 +428,7 @@ mod tests {
             let status = if command == "__handoff" {
                 run_with(
                     cli,
+                    || Ok(()),
                     || result.take().unwrap(),
                     || Ok(false),
                     || Ok(false),
@@ -435,6 +437,7 @@ mod tests {
             } else {
                 run_with(
                     cli,
+                    || Ok(()),
                     || Ok(false),
                     || result.take().unwrap(),
                     || Ok(false),
@@ -447,7 +450,14 @@ mod tests {
         for (healthy, expected) in [(true, 0), (false, 1)] {
             let cli = Cli::try_parse_from(["eiyah", "doctor"])?;
             assert_eq!(
-                run_with(cli, || Ok(false), || Ok(false), || Ok(healthy), || Ok(0),)?,
+                run_with(
+                    cli,
+                    || Ok(()),
+                    || Ok(false),
+                    || Ok(false),
+                    || Ok(healthy),
+                    || Ok(0),
+                )?,
                 expected
             );
         }
@@ -462,8 +472,46 @@ mod tests {
 
         let cli = Cli::try_parse_from(["eiyah", "show-cad-status"])?;
         assert_eq!(
-            run_with(cli, || Ok(false), || Ok(false), || Ok(false), || Ok(37),)?,
+            run_with(
+                cli,
+                || Ok(()),
+                || Ok(false),
+                || Ok(false),
+                || Ok(false),
+                || Ok(37),
+            )?,
             37
+        );
+        Ok(())
+    }
+
+    #[test]
+    // update commandの成功とerrorをPublic CLI statusへ反映することを検証する
+    fn dispatches_update() -> Result<()> {
+        let cli = Cli::try_parse_from(["eiyah", "update"])?;
+        assert_eq!(
+            run_with(
+                cli,
+                || Ok(()),
+                || Ok(false),
+                || Ok(false),
+                || Ok(false),
+                || Ok(0),
+            )?,
+            0
+        );
+
+        let cli = Cli::try_parse_from(["eiyah", "update"])?;
+        assert!(
+            run_with(
+                cli,
+                || Err(anyhow::anyhow!("update failed")),
+                || Ok(false),
+                || Ok(false),
+                || Ok(false),
+                || Ok(0),
+            )
+            .is_err()
         );
         Ok(())
     }

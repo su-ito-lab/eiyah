@@ -466,6 +466,8 @@ fn is_structural_failure(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -524,6 +526,66 @@ mod tests {
         fs::create_dir_all(public_entry.parent().unwrap())?;
         symlink(&binary, public_entry)?;
         save_install_metadata(paths)
+    }
+
+    // update test用のRelease assetを作成する
+    fn release_asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_owned(),
+            browser_download_url: format!("https://example.com/{name}"),
+        }
+    }
+
+    // 指定versionを返す実行可能なtest binaryを作成する
+    fn write_version_binary(path: &Path, version: &str) -> Result<()> {
+        fs::write(
+            path,
+            format!("#!/bin/sh\nprintf 'eiyah {version}\\n'\n").as_bytes(),
+        )?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(CANDIDATE_EXECUTABLE_MODE);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    // binary contentに対応するchecksum asset textを作成する
+    fn checksum_text(content: &[u8]) -> String {
+        let digest = Sha256::digest(content);
+        format!("{digest:x}  {BINARY_ASSET_NAME}\n")
+    }
+
+    // installed targetを持つupdate fixtureを作成する
+    fn create_update_fixture(root: &Path) -> Result<ResolvedPaths> {
+        let paths = fixture_paths(root)?;
+        let binary = paths.eiyah_prefix.join("bin/eiyah");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        write_version_binary(&binary, env!("CARGO_PKG_VERSION"))?;
+        Ok(paths)
+    }
+
+    // current package versionより大きいupdate test用versionを作成する
+    fn newer_version() -> Result<Version> {
+        let mut version = Version::parse(env!("CARGO_PKG_VERSION"))?;
+        version.patch = version
+            .patch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("package patch version cannot be incremented"))?;
+        version.pre = semver::Prerelease::EMPTY;
+        version.build = semver::BuildMetadata::EMPTY;
+        Ok(version)
+    }
+
+    // test用のnewer Release responseを返す
+    fn newer_release(version: &Version) -> ReleaseResponse {
+        ReleaseResponse {
+            tag_name: format!("v{version}"),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                release_asset(BINARY_ASSET_NAME),
+                release_asset(CHECKSUM_ASSET_NAME),
+            ],
+        }
     }
 
     #[test]
@@ -634,5 +696,261 @@ mod tests {
             InstallState::Partial
         );
         Ok(())
+    }
+
+    #[test]
+    // stable responseからversionとrequired assetを選択することを検証する
+    fn builds_release_info_from_stable_response() -> Result<()> {
+        let mut body = ureq::Body::builder().data(format!(
+            r#"{{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[{{"name":"{BINARY_ASSET_NAME}","browser_download_url":"https://example.com/binary"}},{{"name":"{CHECKSUM_ASSET_NAME}","browser_download_url":"https://example.com/checksum"}}]}}"#
+        ));
+        let response = parse_release_response(&mut body)?;
+        let version = validate_release_version(&response)?;
+        let release = release_info(response, version)?;
+
+        assert_eq!(release.version, Version::new(1, 2, 3));
+        assert_eq!(release.binary_url, "https://example.com/binary");
+        assert_eq!(release.checksum_url, "https://example.com/checksum");
+        Ok(())
+    }
+
+    #[test]
+    // draft / prerelease responseをstable Releaseとして受理しないことを検証する
+    fn rejects_unstable_release_response() {
+        for (draft, prerelease) in [(true, false), (false, true)] {
+            assert!(
+                validate_release_version(&ReleaseResponse {
+                    tag_name: "v1.2.3".to_owned(),
+                    draft,
+                    prerelease,
+                    assets: Vec::new(),
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    // malformed tagを拒否しvalid semverを保持することを検証する
+    fn parses_release_versions() -> Result<()> {
+        assert_eq!(parse_release_version("v1.2.3")?, Version::new(1, 2, 3));
+        for tag in ["1.2.3", "v", "v1", "vv1.2.3", "v01.2.3"] {
+            assert!(parse_release_version(tag).is_err(), "{tag}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    // required assetの欠落と重複を拒否することを検証する
+    fn rejects_missing_or_duplicate_release_assets() {
+        let binary = release_asset(BINARY_ASSET_NAME);
+        let checksum = release_asset(CHECKSUM_ASSET_NAME);
+        assert!(select_release_assets(std::slice::from_ref(&binary)).is_err());
+        assert!(
+            select_release_assets(&[binary.clone(), binary.clone(), checksum.clone()]).is_err()
+        );
+        assert!(select_release_assets(&[binary, checksum.clone(), checksum]).is_err());
+    }
+
+    #[test]
+    // checksum exact formatとcalculated SHA-256を検証する
+    fn parses_and_verifies_checksum() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let candidate = directory.path.join("candidate");
+        let content = b"candidate binary";
+        fs::write(&candidate, content)?;
+        let checksum = parse_checksum(&checksum_text(content))?;
+        verify_checksum(&candidate, &checksum)?;
+
+        let mismatched = parse_checksum(&checksum_text(b"other"))?;
+        assert!(verify_checksum(&candidate, &mismatched).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // malformed checksumとfilename不一致を拒否することを検証する
+    fn rejects_invalid_checksum_text() {
+        let digest = "0".repeat(SHA256_HEX_LENGTH);
+        for text in [
+            format!("{digest} {BINARY_ASSET_NAME}\n"),
+            format!("{digest}  wrong-name\n"),
+            format!("{}  {BINARY_ASSET_NAME}\n", "A".repeat(SHA256_HEX_LENGTH)),
+            format!("{digest}  {BINARY_ASSET_NAME}"),
+            format!("{digest}  {BINARY_ASSET_NAME}\nextra\n"),
+        ] {
+            assert!(parse_checksum(&text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    // stale regular candidateだけを削除しsymlinkを拒否することを検証する
+    fn prepares_candidate_path_safely() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let candidate = directory.path.join(CANDIDATE_FILE_NAME);
+        fs::write(&candidate, b"stale")?;
+        prepare_candidate_path(&candidate)?;
+        assert!(!candidate.exists());
+
+        symlink(directory.path.join("target"), &candidate)?;
+        assert!(prepare_candidate_path(&candidate).is_err());
+        assert!(fs::symlink_metadata(&candidate)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    // candidate versionの一致・不一致を判定することを検証する
+    fn validates_candidate_version() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let binary = directory.path.join("eiyah");
+        write_version_binary(&binary, "1.2.3")?;
+        validate_eiyah_binary(&binary, &Version::new(1, 2, 3))?;
+        assert!(validate_eiyah_binary(&binary, &Version::new(1, 2, 4)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // newer binaryだけをatomic replacementしcandidateを残さないことを検証する
+    fn replaces_installed_binary_atomically() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = create_update_fixture(&directory.path)?;
+        let version = newer_version()?;
+        let content = format!("#!/bin/sh\nprintf 'eiyah {version}\\n'\n");
+        let checksum = checksum_text(content.as_bytes());
+
+        update_locked_with(
+            &paths,
+            || Ok(newer_release(&version)),
+            |_, path| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(CANDIDATE_DOWNLOAD_MODE)
+                    .open(path)?;
+                file.write_all(content.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            },
+            |_| Ok(checksum.clone()),
+        )?;
+
+        let installed = paths.eiyah_prefix.join("bin/eiyah");
+        validate_eiyah_binary(&installed, &version)?;
+        assert_eq!(
+            fs::symlink_metadata(&installed)?.permissions().mode() & 0o777,
+            CANDIDATE_EXECUTABLE_MODE
+        );
+        assert!(!installed.with_file_name(CANDIDATE_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    // post-update validation failureでもnew binaryを維持してrollbackしないことを検証する
+    fn keeps_new_binary_after_post_update_validation_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = create_update_fixture(&directory.path)?;
+        let version = newer_version()?;
+        let marker = directory.path.join("candidate-validated");
+        let content = format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then\n  printf 'eiyah {}\\n'\nelse\n  touch '{}'\n  printf 'eiyah {version}\\n'\nfi\n",
+            marker.display(),
+            env!("CARGO_PKG_VERSION"),
+            marker.display()
+        );
+        let checksum = checksum_text(content.as_bytes());
+
+        assert!(
+            update_locked_with(
+                &paths,
+                || Ok(newer_release(&version)),
+                |_, path| {
+                    fs::write(path, content.as_bytes())?;
+                    Ok(())
+                },
+                |_| Ok(checksum.clone()),
+            )
+            .is_err()
+        );
+
+        let installed = paths.eiyah_prefix.join("bin/eiyah");
+        assert_eq!(fs::read(&installed)?, content.as_bytes());
+        assert!(!installed.with_file_name(CANDIDATE_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    // commit point前のvalidation failureでinstalled binaryを維持しcandidateを削除する
+    fn cleans_candidate_after_update_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = create_update_fixture(&directory.path)?;
+        let version = newer_version()?;
+        let content = format!(
+            "#!/bin/sh\nprintf 'eiyah {}\\n'\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let checksum = checksum_text(content.as_bytes());
+
+        assert!(
+            update_locked_with(
+                &paths,
+                || Ok(newer_release(&version)),
+                |_, path| {
+                    fs::write(path, content.as_bytes())?;
+                    Ok(())
+                },
+                |_| Ok(checksum.clone()),
+            )
+            .is_err()
+        );
+
+        let installed = paths.eiyah_prefix.join("bin/eiyah");
+        validate_eiyah_binary(&installed, &Version::parse(env!("CARGO_PKG_VERSION"))?)?;
+        assert!(!installed.with_file_name(CANDIDATE_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    // same / older Releaseではdownloadせずsuccessとなることを検証する
+    fn skips_same_or_older_release() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
+
+        for version in [current.clone(), Version::new(0, 0, 0)] {
+            update_locked_with(
+                &paths,
+                || {
+                    Ok(ReleaseResponse {
+                        tag_name: format!("v{version}"),
+                        draft: false,
+                        prerelease: false,
+                        assets: Vec::new(),
+                    })
+                },
+                |_, _| bail!("binary download must not run"),
+                |_| bail!("checksum download must not run"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    // caller保持中のlockをupdate coreが再取得しないことを検証する
+    fn update_locked_core_reuses_existing_lock() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let _lock = LockGuard::acquire(&paths.state_home)?;
+        update_locked_with(
+            &paths,
+            || {
+                Ok(ReleaseResponse {
+                    tag_name: "v0.0.0".to_owned(),
+                    draft: false,
+                    prerelease: false,
+                    assets: Vec::new(),
+                })
+            },
+            |_, _| bail!("binary download must not run"),
+            |_| bail!("checksum download must not run"),
+        )
     }
 }
