@@ -27,8 +27,9 @@ use config::{
     runtime_home, set_show_cad_status,
 };
 use handoff::{run_handoff, run_show_cad_status_enabled};
+use install::run_update;
 
-// runtime branchで実行可能なPublic / Internal CLI
+// 実装済みのPublic / Internal CLI
 #[derive(Debug, Parser)]
 #[command(name = "eiyah", version)]
 struct Cli {
@@ -37,9 +38,11 @@ struct Cli {
     command: Command,
 }
 
-// runtime branchが本実装を持つcommand
+// 現在本実装を持つcommand
 #[derive(Debug, Subcommand)]
 enum Command {
+    // Public ReleaseからEiyah binaryを更新する
+    Update,
     // Eiyahとsystem configurationを表示する
     Config,
     // Eiyah installationを診断する
@@ -82,6 +85,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     run_with(
         cli,
+        run_update,
         run_handoff,
         run_show_cad_status_enabled,
         run_doctor,
@@ -89,15 +93,20 @@ fn run(cli: Cli) -> Result<u8> {
     )
 }
 
-// runtime dependencyを差し替え可能にしてCLI dispatchを実行する
+// command dependencyを差し替え可能にしてCLI dispatchを実行する
 fn run_with(
     cli: Cli,
+    mut update: impl FnMut() -> Result<()>,
     mut handoff: impl FnMut() -> Result<bool>,
     mut show_cad_status_enabled: impl FnMut() -> Result<bool>,
     mut doctor: impl FnMut() -> Result<bool>,
     mut show_cad_status: impl FnMut() -> Result<u8>,
 ) -> Result<u8> {
     match cli.command {
+        Command::Update => {
+            update()?;
+            Ok(0)
+        }
         Command::Config => {
             print_config(&collect_system_config()?)?;
             Ok(0)

@@ -1,12 +1,13 @@
 // ==================================================
 // @file src/install.rs
-// @brief Installation state detection
+// @brief Installation state detection and binary update
 // ==================================================
 
-use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Error, Result, bail};
@@ -14,7 +15,10 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{ResolvedPaths, discover_install_metadata, load_install_metadata};
+use crate::config::{
+    ResolvedPaths, discover_install_metadata, load_install_metadata, runtime_home,
+};
+use crate::transaction::LockGuard;
 
 // Public Releaseを取得するGitHub API endpoint
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/su-ito-lab/eiyah/releases/latest";
@@ -26,6 +30,12 @@ const GITHUB_API_VERSION: &str = "2026-03-10";
 const BINARY_ASSET_NAME: &str = "eiyah-x86_64-unknown-linux-gnu";
 // Public Releaseに必須のchecksum asset名
 const CHECKSUM_ASSET_NAME: &str = "eiyah-x86_64-unknown-linux-gnu.sha256";
+// atomic replacement前のcandidate file名
+const CANDIDATE_FILE_NAME: &str = ".eiyah.new";
+// download中のcandidate permission
+const CANDIDATE_DOWNLOAD_MODE: u32 = 0o600;
+// 検証・実行可能なcandidate permission
+const CANDIDATE_EXECUTABLE_MODE: u32 = 0o755;
 // GitHub接続確立までの上限秒数
 const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 // request全体の上限秒数
@@ -177,6 +187,27 @@ fn select_release_assets(assets: &[ReleaseAsset]) -> Result<(String, String)> {
     Ok((binary_url, checksum_url))
 }
 
+/// HTTPS assetをsecure candidate fileへdownloadして同期する
+pub fn download_to_file(url: &str, path: &Path) -> Result<()> {
+    require_https_url(url)?;
+    let agent = http_agent();
+    let mut response = agent
+        .get(url)
+        .call()
+        .with_context(|| format!("failed to download {url}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(CANDIDATE_DOWNLOAD_MODE)
+        .open(path)
+        .with_context(|| format!("failed to create candidate {}", path.display()))?;
+    io::copy(&mut response.body_mut().as_reader(), &mut file)
+        .with_context(|| format!("failed to write candidate {}", path.display()))?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// HTTPS assetをchecksum textとしてdownloadする
 pub fn download_text(url: &str) -> Result<String> {
     require_https_url(url)?;
@@ -226,6 +257,88 @@ pub fn verify_checksum(path: &Path, expected: &[u8; 32]) -> Result<()> {
         bail!("downloaded Eiyah checksum does not match");
     }
     Ok(())
+}
+
+/// Eiyah binaryの`--version` outputがexpected versionと一致することを検証する
+pub fn validate_eiyah_binary(path: &Path, expected_version: &Version) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to execute {}", path.display()))?;
+    if !output.status.success() {
+        bail!("Eiyah version validation failed: {}", path.display());
+    }
+    let stdout =
+        std::str::from_utf8(&output.stdout).context("Eiyah version output is not valid UTF-8")?;
+    let expected = format!("eiyah {expected_version}");
+    if stdout.trim() != expected {
+        bail!(
+            "unexpected Eiyah version output from {}: {}",
+            path.display(),
+            stdout.trim()
+        );
+    }
+    Ok(())
+}
+
+/// installed metadataからpathを復元してexclusive lock内で更新する
+pub fn run_update() -> Result<()> {
+    let home = runtime_home()?;
+    let metadata_path = discover_install_metadata(&home.join(".local/bin/eiyah"))?;
+    let paths = ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)?;
+    let _lock = LockGuard::acquire(&paths.state_home)?;
+    update_locked(&paths)
+}
+
+/// callerが保持するoperation lock内でEiyah binaryを更新する
+pub fn update_locked(paths: &ResolvedPaths) -> Result<()> {
+    update_locked_with(paths, fetch_latest_release, download_to_file, download_text)
+}
+
+// network dependencyを差し替え可能にして更新transactionを実行する
+fn update_locked_with(
+    paths: &ResolvedPaths,
+    mut fetch_release: impl FnMut() -> Result<ReleaseResponse>,
+    mut download_binary: impl FnMut(&str, &Path) -> Result<()>,
+    mut download_checksum: impl FnMut(&str) -> Result<String>,
+) -> Result<()> {
+    let current_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).context("current package version is invalid")?;
+    let response = fetch_release()?;
+    let remote_version = validate_release_version(&response)?;
+    if remote_version <= current_version {
+        return Ok(());
+    }
+    let release = release_info(response, remote_version)?;
+
+    let binary_directory = paths.eiyah_prefix.join("bin");
+    let installed = binary_directory.join("eiyah");
+    validate_installed_target(&installed)?;
+    let candidate = binary_directory.join(CANDIDATE_FILE_NAME);
+    prepare_candidate_path(&candidate)?;
+
+    let prepared = (|| -> Result<()> {
+        download_binary(&release.binary_url, &candidate)?;
+        let checksum = parse_checksum(&download_checksum(&release.checksum_url)?)?;
+        verify_checksum(&candidate, &checksum)?;
+
+        let mut permissions = fs::symlink_metadata(&candidate)?.permissions();
+        permissions.set_mode(CANDIDATE_EXECUTABLE_MODE);
+        fs::set_permissions(&candidate, permissions)?;
+        fs::File::open(&candidate)?.sync_all()?;
+        validate_eiyah_binary(&candidate, &release.version)?;
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        cleanup_candidate(&candidate);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&candidate, &installed) {
+        cleanup_candidate(&candidate);
+        return Err(error.into());
+    }
+    validate_eiyah_binary(&installed, &release.version)
 }
 
 // stable flagとrequired assetから更新情報を組み立てる
@@ -283,6 +396,38 @@ fn require_https_url(url: &str) -> Result<()> {
         bail!("Release asset URL must use HTTPS: {url}");
     }
     Ok(())
+}
+
+// installed targetが上書き可能なregular executableであることを確認する
+fn validate_installed_target(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("installed Eiyah binary is unavailable: {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        bail!(
+            "installed Eiyah binary must be a regular executable file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// stale regular fileだけを削除してsecure creation可能な状態にする
+fn prepare_candidate_path(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path)?,
+        Ok(_) => bail!(
+            "update candidate path must be missing or a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+// commit point前のcandidateをbest effortで削除する
+fn cleanup_candidate(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 // symlinkを追跡せずpath entryの存在を確認する
