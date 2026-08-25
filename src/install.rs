@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Error, Result, bail};
 use semver::Version;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::config::{ResolvedPaths, discover_install_metadata, load_install_metadata};
 
@@ -31,6 +32,8 @@ const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const GLOBAL_TIMEOUT_SECONDS: u64 = 30;
 // GitHubおよびasset requestのredirect上限
 const REDIRECT_LIMIT: u32 = 10;
+// SHA-256をlowercase hexで表した文字数
+const SHA256_HEX_LENGTH: usize = 64;
 
 /// 更新に使用するstable Public Releaseの情報
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +175,57 @@ fn select_release_assets(assets: &[ReleaseAsset]) -> Result<(String, String)> {
     let binary_url = select_release_asset(assets, BINARY_ASSET_NAME)?;
     let checksum_url = select_release_asset(assets, CHECKSUM_ASSET_NAME)?;
     Ok((binary_url, checksum_url))
+}
+
+/// HTTPS assetをchecksum textとしてdownloadする
+pub fn download_text(url: &str) -> Result<String> {
+    require_https_url(url)?;
+    let agent = http_agent();
+    agent
+        .get(url)
+        .call()
+        .with_context(|| format!("failed to download {url}"))?
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("failed to read {url}"))
+}
+
+/// checksum assetのexact one-line formatを検証してdigestを返す
+pub fn parse_checksum(text: &str) -> Result<[u8; 32]> {
+    let expected_suffix = format!("  {BINARY_ASSET_NAME}\n");
+    if text.len() != SHA256_HEX_LENGTH + expected_suffix.len() || !text.ends_with(&expected_suffix)
+    {
+        bail!("invalid checksum file format");
+    }
+
+    let hexadecimal = &text[..SHA256_HEX_LENGTH];
+    if !hexadecimal
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("checksum must be lowercase SHA-256 hexadecimal");
+    }
+
+    let mut checksum = [0_u8; 32];
+    for (index, byte) in checksum.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&hexadecimal[offset..offset + 2], 16)
+            .context("failed to parse checksum")?;
+    }
+    Ok(checksum)
+}
+
+/// candidate fileのSHA-256がRelease checksumと一致することを検証する
+pub fn verify_checksum(path: &Path, expected: &[u8; 32]) -> Result<()> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open candidate {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    let calculated = hasher.finalize();
+    if calculated.as_slice() != expected {
+        bail!("downloaded Eiyah checksum does not match");
+    }
+    Ok(())
 }
 
 // stable flagとrequired assetから更新情報を組み立てる
