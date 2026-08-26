@@ -1146,6 +1146,153 @@ fn run_stow_with(
     Ok(())
 }
 
+// --------------------------------------------------
+// Managed Environment Removal
+// --------------------------------------------------
+
+// managed pathに要求するfilesystem形状
+enum ManagedRemovalKind<'a> {
+    // expected absolute targetを持つsymlink
+    ExactSymlink(&'a Path),
+    // symlinkではないregular file
+    RegularFile,
+    // symlinkではないdirectory tree
+    Directory,
+}
+
+/// managed Stow packageを逆順にすべてunstowする
+pub fn unstow_managed_packages(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    unstow_managed_packages_with(paths, home, |command| command.status().map_err(Into::into))
+}
+
+// Stow実行を差し替え可能にして全packageのfailureを集約する
+fn unstow_managed_packages_with(
+    paths: &ResolvedPaths,
+    home: &Path,
+    mut execute: impl FnMut(&mut Command) -> Result<ExitStatus>,
+) -> Result<()> {
+    let executable = paths.pixi_home.join("bin/stow");
+    let dotfiles = home.join(".dotfiles");
+    validate_non_symlink_directory(&dotfiles, "dotfiles")?;
+    let mut packages = stow_packages(paths, &dotfiles)?;
+    packages.reverse();
+
+    let mut failures = Vec::new();
+    for package in packages {
+        let mut command = Command::new(&executable);
+        command
+            .arg("--delete")
+            .arg("--target")
+            .arg(home)
+            .arg("--dir")
+            .arg(&dotfiles)
+            .arg(&package)
+            .current_dir(&dotfiles)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        match execute(&mut command) {
+            Ok(status) if status.success() => {}
+            Ok(status) => failures.push(format!("{}: {status}", package.to_string_lossy())),
+            Err(error) => failures.push(format!("{}: {error:#}", package.to_string_lossy())),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("failed to unstow managed packages: {}", failures.join("; "));
+    }
+    Ok(())
+}
+
+/// expected show-cad-status public entryだけを削除する
+pub fn remove_show_cad_status_entry(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    let entry = home.join(".local/bin/show-cad-status");
+    let target = paths.eiyah_prefix.join("bin/show-cad-status");
+    remove_managed_path(&entry, ManagedRemovalKind::ExactSymlink(&target))
+}
+
+/// persistent managed contentを仕様順に削除する
+pub fn remove_managed_content(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    let targets = [
+        (
+            paths.eiyah_prefix.join("bin/show-cad-status"),
+            ManagedRemovalKind::RegularFile,
+        ),
+        (paths.eiyah_config.clone(), ManagedRemovalKind::RegularFile),
+        (home.join(".dotfiles"), ManagedRemovalKind::Directory),
+        (paths.pixi_home.clone(), ManagedRemovalKind::Directory),
+        (
+            paths.eiyah_prefix.join("install.toml"),
+            ManagedRemovalKind::RegularFile,
+        ),
+    ];
+    for (path, kind) in targets {
+        remove_managed_path(&path, kind)?;
+    }
+    Ok(())
+}
+
+/// Eiyah cache namespaceだけを削除する
+pub fn cleanup_uninstall_cache(paths: &ResolvedPaths) -> Result<()> {
+    remove_managed_path(
+        &paths.cache_home.join("eiyah"),
+        ManagedRemovalKind::Directory,
+    )
+}
+
+// managed pathを削除直前にidentity再確認して他者所有pathを保護する
+fn remove_managed_path(path: &Path, kind: ManagedRemovalKind<'_>) -> Result<()> {
+    remove_managed_path_with(path, kind, |_| Ok(()))
+}
+
+// identity確認間のraceをtest可能にしてmanaged pathを削除する
+fn remove_managed_path_with(
+    path: &Path,
+    kind: ManagedRemovalKind<'_>,
+    before_recheck: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    match kind {
+        ManagedRemovalKind::ExactSymlink(expected) => {
+            if !metadata.file_type().is_symlink()
+                || !expected.is_absolute()
+                || fs::read_link(path)? != expected
+            {
+                bail!("invalid managed symlink: {}", path.display());
+            }
+        }
+        ManagedRemovalKind::RegularFile => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                bail!("managed path must be a regular file: {}", path.display());
+            }
+        }
+        ManagedRemovalKind::Directory => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                bail!("managed path must be a directory: {}", path.display());
+            }
+        }
+    }
+
+    let identity = PathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    before_recheck(path)?;
+    if PathIdentity::from_path(path)? != identity {
+        bail!("managed path identity changed: {}", path.display());
+    }
+    match kind {
+        ManagedRemovalKind::Directory => fs::remove_dir_all(path)?,
+        ManagedRemovalKind::ExactSymlink(_) | ManagedRemovalKind::RegularFile => {
+            fs::remove_file(path)?
+        }
+    }
+    Ok(())
+}
+
 /// authenticated Private Release assetからshow-cad-status binaryを配置する
 pub fn install_show_cad_status(
     paths: &ResolvedPaths,
@@ -4876,6 +5023,206 @@ mod tests {
             })
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    // managed packageを逆byte順・canonical argvで全件unstowしfailureを集約する
+    fn unstows_all_managed_packages_in_reverse_order() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"stow")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+        let home = directory.path.join("home");
+        let dotfiles = home.join(".dotfiles");
+        fs::create_dir_all(dotfiles.join("git"))?;
+        fs::create_dir(dotfiles.join("tcsh"))?;
+        fs::create_dir(dotfiles.join("zsh"))?;
+        let mut visited = Vec::new();
+
+        let error = unstow_managed_packages_with(&paths, &home, |command| {
+            assert_eq!(command.get_program(), stow);
+            assert_eq!(command.get_current_dir(), Some(dotfiles.as_path()));
+            let arguments = command
+                .get_args()
+                .map(OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &arguments[..5],
+                [
+                    OsString::from("--delete"),
+                    OsString::from("--target"),
+                    home.as_os_str().to_os_string(),
+                    OsString::from("--dir"),
+                    dotfiles.as_os_str().to_os_string(),
+                ]
+            );
+            let package = arguments[5].clone();
+            visited.push(package.clone());
+            if package == OsStr::new("zsh") {
+                Ok(std::process::ExitStatus::from_raw(9))
+            } else {
+                Ok(std::process::ExitStatus::from_raw(1 << 8))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            visited,
+            [
+                OsString::from("zsh"),
+                OsString::from("tcsh"),
+                OsString::from("git")
+            ]
+        );
+        let message = error.to_string();
+        assert!(message.contains("zsh"));
+        assert!(message.contains("tcsh"));
+        assert!(message.contains("git"));
+        assert!(dotfiles.exists());
+
+        fs::remove_file(&stow)?;
+        assert!(unstow_managed_packages_with(&paths, &home, |_| unreachable!()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // exact show-cad-status entryだけを削除しwrong targetを維持する
+    fn removes_only_expected_show_cad_status_entry() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/show-cad-status");
+        let target = paths.eiyah_prefix.join("bin/show-cad-status");
+        fs::create_dir_all(entry.parent().unwrap())?;
+        symlink(&target, &entry)?;
+        remove_show_cad_status_entry(&paths, &home)?;
+        assert!(fs::symlink_metadata(&entry).is_err());
+        remove_show_cad_status_entry(&paths, &home)?;
+
+        symlink(paths.eiyah_prefix.join("bin/other"), &entry)?;
+        assert!(remove_show_cad_status_entry(&paths, &home).is_err());
+        assert!(fs::symlink_metadata(&entry)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    // managed contentだけを削除してuninstall後も保持するpathを変更しない
+    fn removes_managed_content_in_eiyah_namespaces() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let binary = paths.eiyah_prefix.join("bin/show-cad-status");
+        let eiyah = paths.eiyah_prefix.join("bin/eiyah");
+        let metadata = paths.eiyah_prefix.join("install.toml");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        fs::write(&binary, b"status")?;
+        fs::write(&eiyah, b"eiyah")?;
+        fs::write(&metadata, b"metadata")?;
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+        fs::write(&paths.eiyah_config, b"config")?;
+        fs::create_dir_all(home.join(".dotfiles/git"))?;
+        fs::create_dir_all(paths.pixi_home.join("bin"))?;
+        fs::create_dir_all(paths.state_home.join("eiyah/backup"))?;
+        fs::create_dir_all(home.join(".ssh"))?;
+
+        remove_managed_content(&paths, &home)?;
+
+        for path in [
+            binary,
+            paths.eiyah_config.clone(),
+            home.join(".dotfiles"),
+            paths.pixi_home.clone(),
+            metadata,
+        ] {
+            assert!(fs::symlink_metadata(path).is_err());
+        }
+        assert!(eiyah.exists());
+        assert!(paths.eiyah_prefix.exists());
+        assert!(paths.state_home.join("eiyah/backup").exists());
+        assert!(home.join(".ssh").exists());
+        Ok(())
+    }
+
+    #[test]
+    // identity raceで置換された他者所有fileを削除しない
+    fn preserves_replaced_managed_path_during_removal() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let target = directory.path.join("managed");
+        let original = directory.path.join("original");
+        fs::write(&target, b"original")?;
+
+        let error = remove_managed_path_with(&target, ManagedRemovalKind::RegularFile, |path| {
+            fs::rename(path, &original)?;
+            fs::write(path, b"other owner")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(fs::read(&target)?, b"other owner");
+        assert_eq!(fs::read(&original)?, b"original");
+        Ok(())
+    }
+
+    #[test]
+    // managed pathのwrong file typeを拒否してexisting pathを維持する
+    fn rejects_wrong_managed_removal_types() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let file = directory.path.join("file");
+        let tree = directory.path.join("tree");
+        fs::write(&file, b"file")?;
+        fs::create_dir(&tree)?;
+
+        assert!(remove_managed_path(&file, ManagedRemovalKind::Directory).is_err());
+        assert!(remove_managed_path(&tree, ManagedRemovalKind::RegularFile).is_err());
+        assert!(file.is_file());
+        assert!(tree.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    // cache namespaceだけを再帰削除してcache parentを保持する
+    fn cleans_only_eiyah_cache_namespace() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let cache = paths.cache_home.join("eiyah");
+        fs::create_dir_all(cache.join("downloads"))?;
+        fs::write(cache.join("downloads/archive"), b"archive")?;
+        fs::create_dir_all(paths.cache_home.join("other"))?;
+
+        cleanup_uninstall_cache(&paths)?;
+
+        assert!(fs::symlink_metadata(&cache).is_err());
+        assert!(paths.cache_home.exists());
+        assert!(paths.cache_home.join("other").exists());
+        cleanup_uninstall_cache(&paths)?;
+
+        symlink(paths.cache_home.join("other"), &cache)?;
+        assert!(cleanup_uninstall_cache(&paths).is_err());
+        assert!(fs::symlink_metadata(&cache)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    // identity raceで置換された他者所有directory treeを削除しない
+    fn preserves_replaced_managed_directory_during_removal() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let target = directory.path.join("managed");
+        let original = directory.path.join("original");
+        fs::create_dir(&target)?;
+        fs::write(target.join("owned"), b"owned")?;
+
+        let error = remove_managed_path_with(&target, ManagedRemovalKind::Directory, |path| {
+            fs::rename(path, &original)?;
+            fs::create_dir(path)?;
+            fs::write(path.join("other"), b"other owner")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(fs::read(target.join("other"))?, b"other owner");
+        assert_eq!(fs::read(original.join("owned"))?, b"owned");
         Ok(())
     }
 
