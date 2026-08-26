@@ -3,11 +3,14 @@
 // @brief Installation state detection and binary update
 // ==================================================
 
-use std::fs::{self, OpenOptions};
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,6 +64,16 @@ const DEVICE_SLOW_DOWN_SECONDS: u64 = 5;
 const SHOW_CAD_STATUS_ASSET_NAME: &str = "show-cad-status-x86_64-unknown-linux-gnu";
 // Private Releaseから取得するshow-cad-status checksum asset名
 const SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME: &str = "show-cad-status-x86_64-unknown-linux-gnu.sha256";
+// Eiyahが新規作成するSSH directory permission
+const SSH_DIRECTORY_MODE: u32 = 0o700;
+// Eiyahが新規生成するSSH private key permission
+const SSH_PRIVATE_KEY_MODE: u32 = 0o600;
+// Eiyahが新規生成するSSH public key permission
+const SSH_PUBLIC_KEY_MODE: u32 = 0o644;
+// Eiyahが新規作成するauthorized_keys permission
+const AUTHORIZED_KEYS_MODE: u32 = 0o600;
+// authorized_keys temporary file名の衝突を避けるprocess内連番
+static AUTHORIZED_KEYS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 更新に使用するstable Public Releaseの情報
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +156,17 @@ struct PrivateReleaseAsset {
     name: String,
     // authenticated asset downloadに使用するGitHub ID
     id: u64,
+}
+
+// OpenSSH public key lineから比較に必要なfieldを保持する
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SshPublicKey {
+    // key algorithmを表す先頭field
+    key_type: Vec<u8>,
+    // encoded public key dataを表す第2 field
+    key_data: Vec<u8>,
+    // authorized_keysへ追加できるtrim済みoriginal line
+    line: Vec<u8>,
 }
 
 // GitHub latest Release responseで使用するfield
@@ -426,6 +450,298 @@ fn select_private_release_asset(
         bail!("required Private Release asset is duplicated: {expected_name}");
     }
     Ok(id)
+}
+
+/// `$HOME`配下のed25519 key pairと`authorized_keys`を準備する
+pub fn bootstrap_ssh(home: &Path) -> Result<()> {
+    let user = env::var_os("USER").filter(|value| !value.is_empty());
+    bootstrap_ssh_with(home, user.as_deref(), |command| command.output())
+}
+
+// ssh-keygen実行を差し替え可能にしてSSH bootstrapを行う
+fn bootstrap_ssh_with(
+    home: &Path,
+    user: Option<&OsStr>,
+    mut execute: impl FnMut(&mut Command) -> io::Result<Output>,
+) -> Result<()> {
+    let ssh_directory = home.join(".ssh");
+    ensure_ssh_directory(&ssh_directory)?;
+    let private_key = ssh_directory.join("id_ed25519");
+    let public_key = ssh_directory.join("id_ed25519.pub");
+    let authorized_keys = ssh_directory.join("authorized_keys");
+    validate_optional_regular_file(&private_key)?;
+    validate_optional_regular_file(&public_key)?;
+    validate_optional_regular_file(&authorized_keys)?;
+
+    let private_exists = path_exists(&private_key)?;
+    let public_exists = path_exists(&public_key)?;
+    let key = match (private_exists, public_exists) {
+        (true, true) => {
+            let derived = derive_public_key(&private_key, &mut execute)?;
+            let existing = parse_public_key(&fs::read(&public_key)?)?;
+            if !same_public_key(&derived, &existing) {
+                bail!("SSH private and public keys do not match");
+            }
+            existing
+        }
+        (true, false) => {
+            let derived = derive_public_key(&private_key, &mut execute)?;
+            write_new_public_key(&public_key, &derived)?;
+            derived
+        }
+        (false, true) => bail!("SSH public key exists without its private key"),
+        (false, false) => {
+            let user = user.ok_or_else(|| anyhow::anyhow!("USER is unavailable"))?;
+            let mut key_pair_created = false;
+            let generated = (|| -> Result<SshPublicKey> {
+                generate_key_pair(&private_key, user, &mut execute)?;
+                key_pair_created = true;
+                validate_required_regular_file(&private_key)?;
+                validate_required_regular_file(&public_key)?;
+                set_file_mode(&private_key, SSH_PRIVATE_KEY_MODE)?;
+                set_file_mode(&public_key, SSH_PUBLIC_KEY_MODE)?;
+                parse_public_key(&fs::read(&public_key)?)
+            })();
+            if generated.is_err() && key_pair_created {
+                cleanup_generated_key_pair(&private_key);
+            }
+            generated?
+        }
+    };
+
+    update_authorized_keys(&authorized_keys, &key)
+}
+
+// `.ssh`を検証しmissing時だけ規定permissionで作成する
+fn ensure_ssh_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => bail!(
+            "SSH path must be a non-symlink directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(SSH_DIRECTORY_MODE).create(path)?;
+            set_file_mode(path, SSH_DIRECTORY_MODE)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+// optional SSH fileが存在する場合にregular non-symlinkであることを確認する
+fn validate_optional_regular_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => bail!(
+            "SSH path must be a non-symlink regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// ssh-keygenが作成すべきfileの形状を確認する
+fn validate_required_regular_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("SSH key was not created: {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "SSH key must be a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// private keyからOpenSSH public keyを導出する
+fn derive_public_key(
+    private_key: &Path,
+    execute: &mut impl FnMut(&mut Command) -> io::Result<Output>,
+) -> Result<SshPublicKey> {
+    let mut command = Command::new("ssh-keygen");
+    command
+        .arg("-y")
+        .arg("-f")
+        .arg(private_key)
+        .stdin(Stdio::null());
+    let output = execute(&mut command).context("failed to execute ssh-keygen -y")?;
+    if !output.status.success() {
+        bail!(
+            "ssh-keygen -y failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_public_key(&output.stdout)
+}
+
+// ed25519 key pairをnon-interactiveに生成する
+fn generate_key_pair(
+    private_key: &Path,
+    user: &OsStr,
+    execute: &mut impl FnMut(&mut Command) -> io::Result<Output>,
+) -> Result<()> {
+    let mut comment = OsString::from(user);
+    comment.push("@cad");
+    let mut command = Command::new("ssh-keygen");
+    command
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-f")
+        .arg(private_key)
+        .arg("-N")
+        .arg("")
+        .arg("-C")
+        .arg(comment)
+        .stdin(Stdio::null());
+    let output = execute(&mut command).context("failed to execute ssh-keygen")?;
+    if !output.status.success() {
+        bail!(
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+// ssh-keygen成功後に確認済みの新規key pairをbest effortで削除する
+fn cleanup_generated_key_pair(private_key: &Path) {
+    let _ = fs::remove_file(private_key);
+    let _ = fs::remove_file(private_key.with_extension("pub"));
+}
+
+// OpenSSH public key grammarから比較fieldと保存lineを復元する
+fn parse_public_key(content: &[u8]) -> Result<SshPublicKey> {
+    let line = trim_ascii_whitespace(content);
+    if line.is_empty() || line.contains(&b'\n') || line.contains(&b'\r') {
+        bail!("SSH public key must contain exactly one valid line");
+    }
+    let mut fields = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let key_type = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("SSH public key type is missing"))?;
+    let key_data = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("SSH public key data is missing"))?;
+    Ok(SshPublicKey {
+        key_type: key_type.to_vec(),
+        key_data: key_data.to_vec(),
+        line: line.to_vec(),
+    })
+}
+
+// public keyのtypeとencoded dataだけを比較する
+fn same_public_key(left: &SshPublicKey, right: &SshPublicKey) -> bool {
+    left.key_type == right.key_type && left.key_data == right.key_data
+}
+
+// private keyから導出したpublic keyをcreate_newで保存する
+fn write_new_public_key(path: &Path, key: &SshPublicKey) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SSH_PUBLIC_KEY_MODE)
+        .open(path)?;
+    let result = (|| -> Result<()> {
+        set_file_mode(path, SSH_PUBLIC_KEY_MODE)?;
+        file.write_all(&key.line)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+// authorized_keysへ同一keyがない場合だけatomic replacementで追加する
+fn update_authorized_keys(path: &Path, key: &SshPublicKey) -> Result<()> {
+    let existing = match fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if existing
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| parse_public_key(line).ok())
+        .any(|candidate| same_public_key(&candidate, key))
+    {
+        return Ok(());
+    }
+
+    let mode = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o7777,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => AUTHORIZED_KEYS_MODE,
+        Err(error) => return Err(error.into()),
+    };
+    let temporary = authorized_keys_temporary_path(path);
+    replace_authorized_keys(path, &temporary, &existing, key, mode)
+}
+
+// 指定temporary pathを使用してauthorized_keysをatomic replacementする
+fn replace_authorized_keys(
+    path: &Path,
+    temporary: &Path,
+    existing: &[u8],
+    key: &SshPublicKey,
+    mode: u32,
+) -> Result<()> {
+    let mut temporary_created = false;
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(temporary)?;
+        temporary_created = true;
+        set_file_mode(temporary, mode)?;
+        file.write_all(existing)?;
+        if !existing.is_empty() && !existing.ends_with(b"\n") {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(&key.line)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() && temporary_created {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+// authorized_keysと同じdirectoryへprocess固有のtemporary pathを割り当てる
+fn authorized_keys_temporary_path(path: &Path) -> std::path::PathBuf {
+    let sequence = AUTHORIZED_KEYS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".authorized_keys.eiyah.{}.{sequence}",
+        std::process::id()
+    ))
+}
+
+// byte列のleading / trailing ASCII whitespaceを除く
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+// Eiyahが作成したSSH fileへ規定permissionを適用する
+fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
+    let mut permissions = fs::symlink_metadata(path)?.permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 // GitHubのlatest endpointからPublic Release responseを取得する
@@ -745,7 +1061,9 @@ fn is_structural_failure(error: &Error) -> bool {
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -884,6 +1202,22 @@ mod tests {
                 private_release_asset(SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME, 102),
             ],
         }
+    }
+
+    // ssh-keygen test doubleが返すprocess outputを作成する
+    fn ssh_keygen_output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(status << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    // SSH bootstrap test用HOME directoryを作成する
+    fn ssh_home(directory: &TestDirectory) -> Result<PathBuf> {
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+        Ok(home)
     }
 
     #[test]
@@ -1381,5 +1715,266 @@ mod tests {
         let mut empty_tag = stable_private_release();
         empty_tag.tag_name.clear();
         assert!(private_release_info(empty_tag).is_err());
+    }
+
+    #[test]
+    // existing key pairを照合し同一authorized keyを重複追加しないことを検証する
+    fn reuses_matching_ssh_key_pair() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(ssh.join("id_ed25519"), b"private")?;
+        fs::write(
+            ssh.join("id_ed25519.pub"),
+            b"ssh-ed25519 AAAA existing-comment\n",
+        )?;
+        let authorized = b"  ssh-ed25519   AAAA other-comment  \n";
+        fs::write(ssh.join("authorized_keys"), authorized)?;
+
+        bootstrap_ssh_with(&home, Some(OsStr::new("user")), |command| {
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    OsStr::new("-y"),
+                    OsStr::new("-f"),
+                    ssh.join("id_ed25519").as_os_str()
+                ]
+            );
+            Ok(ssh_keygen_output(0, b"ssh-ed25519 AAAA derived\n", b""))
+        })?;
+
+        assert_eq!(fs::read(ssh.join("authorized_keys"))?, authorized);
+        Ok(())
+    }
+
+    #[test]
+    // private keyからmissing public keyを導出してauthorized_keysへ追加する
+    fn derives_missing_ssh_public_key() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(ssh.join("id_ed25519"), b"private")?;
+
+        bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+            Ok(ssh_keygen_output(
+                0,
+                b" ssh-ed25519 AAAA derived-comment \n",
+                b"",
+            ))
+        })?;
+
+        assert_eq!(
+            fs::read(ssh.join("id_ed25519.pub"))?,
+            b"ssh-ed25519 AAAA derived-comment\n"
+        );
+        assert_eq!(
+            fs::metadata(ssh.join("id_ed25519.pub"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            SSH_PUBLIC_KEY_MODE
+        );
+        assert_eq!(
+            fs::read(ssh.join("authorized_keys"))?,
+            b"ssh-ed25519 AAAA derived-comment\n"
+        );
+        assert_eq!(
+            fs::metadata(ssh.join("authorized_keys"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            AUTHORIZED_KEYS_MODE
+        );
+        Ok(())
+    }
+
+    #[test]
+    // key pairをnon-interactive argvとnon-UTF-8 USER commentで新規生成する
+    fn generates_new_ssh_key_pair() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        let user = OsString::from_vec(vec![b'u', 0x80]);
+
+        bootstrap_ssh_with(&home, Some(&user), |command| {
+            let private = ssh.join("id_ed25519");
+            let mut comment = user.clone();
+            comment.push("@cad");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    OsStr::new("-t"),
+                    OsStr::new("ed25519"),
+                    OsStr::new("-f"),
+                    private.as_os_str(),
+                    OsStr::new("-N"),
+                    OsStr::new(""),
+                    OsStr::new("-C"),
+                    comment.as_os_str(),
+                ]
+            );
+            fs::write(&private, b"private")?;
+            fs::write(ssh.join("id_ed25519.pub"), b"ssh-ed25519 AAAA generated\n")?;
+            Ok(ssh_keygen_output(0, b"", b""))
+        })?;
+
+        assert_eq!(
+            fs::metadata(&ssh)?.permissions().mode() & 0o777,
+            SSH_DIRECTORY_MODE
+        );
+        assert_eq!(
+            fs::metadata(ssh.join("id_ed25519"))?.permissions().mode() & 0o777,
+            SSH_PRIVATE_KEY_MODE
+        );
+        assert_eq!(
+            fs::metadata(ssh.join("id_ed25519.pub"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            SSH_PUBLIC_KEY_MODE
+        );
+        Ok(())
+    }
+
+    #[test]
+    // invalid key stateとmismatched key pairを拒否することを検証する
+    fn rejects_invalid_ssh_key_state() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(ssh.join("id_ed25519.pub"), b"ssh-ed25519 AAAA public\n")?;
+        assert!(bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| unreachable!()).is_err());
+
+        fs::write(ssh.join("id_ed25519"), b"private")?;
+        assert!(
+            bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| Ok(ssh_keygen_output(
+                0,
+                b"ssh-ed25519 BBBB derived\n",
+                b""
+            )))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    // missing USER・symlink・malformed public keyを拒否することを検証する
+    fn rejects_invalid_ssh_bootstrap_inputs() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        assert!(bootstrap_ssh_with(&home, None, |_| unreachable!()).is_err());
+
+        let linked_home = directory.path.join("linked-home");
+        fs::create_dir(&linked_home)?;
+        symlink(home.join(".ssh"), linked_home.join(".ssh"))?;
+        assert!(
+            bootstrap_ssh_with(&linked_home, Some(OsStr::new("user")), |_| unreachable!()).is_err()
+        );
+
+        for content in [
+            b"".as_slice(),
+            b"ssh-ed25519",
+            b"ssh-ed25519 AAAA\nsecond BBBB",
+        ] {
+            assert!(parse_public_key(content).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    // ssh-keygen成功後のinvalid key pairを今回の生成物としてcleanupすることを検証する
+    fn cleans_invalid_generated_ssh_key_pair() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        assert!(
+            bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+                fs::write(ssh.join("id_ed25519"), b"partial private")?;
+                fs::write(ssh.join("id_ed25519.pub"), b"partial")?;
+                Ok(ssh_keygen_output(0, b"", b""))
+            })
+            .is_err()
+        );
+        assert!(!ssh.join("id_ed25519").exists());
+        assert!(!ssh.join("id_ed25519.pub").exists());
+        Ok(())
+    }
+
+    #[test]
+    // ssh-keygen失敗時に別processが作成した可能性のあるkeyを削除しない
+    fn preserves_unowned_keys_after_ssh_keygen_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        assert!(
+            bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+                fs::write(ssh.join("id_ed25519"), b"concurrent private")?;
+                fs::write(ssh.join("id_ed25519.pub"), b"ssh-ed25519 AAAA concurrent\n")?;
+                Ok(ssh_keygen_output(1, b"", b"path appeared"))
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(ssh.join("id_ed25519"))?, b"concurrent private");
+        assert_eq!(
+            fs::read(ssh.join("id_ed25519.pub"))?,
+            b"ssh-ed25519 AAAA concurrent\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    // authorized_keys temporary衝突時に既存temporary fileを削除しない
+    fn preserves_colliding_authorized_keys_temporary_file() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let authorized = directory.path.join("authorized_keys");
+        let temporary = directory.path.join("existing-temporary");
+        fs::write(&temporary, b"unowned temporary")?;
+        let key = parse_public_key(b"ssh-ed25519 AAAA key")?;
+
+        assert!(
+            replace_authorized_keys(&authorized, &temporary, b"", &key, AUTHORIZED_KEYS_MODE)
+                .is_err()
+        );
+        assert_eq!(fs::read(&temporary)?, b"unowned temporary");
+        assert!(!authorized.exists());
+        Ok(())
+    }
+
+    #[test]
+    // authorized_keysのbinary内容・newline・既存permissionを維持してkeyを追加する
+    fn appends_ssh_authorized_key_atomically() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(ssh.join("id_ed25519"), b"private")?;
+        fs::write(ssh.join("id_ed25519.pub"), b"ssh-ed25519 AAAA public\n")?;
+        let authorized_path = ssh.join("authorized_keys");
+        fs::write(&authorized_path, b"unrelated-\xff-line")?;
+        fs::set_permissions(&authorized_path, fs::Permissions::from_mode(0o640))?;
+
+        bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+            Ok(ssh_keygen_output(0, b"ssh-ed25519 AAAA\n", b""))
+        })?;
+
+        assert_eq!(
+            fs::read(&authorized_path)?,
+            b"unrelated-\xff-line\nssh-ed25519 AAAA public\n"
+        );
+        assert_eq!(
+            fs::metadata(&authorized_path)?.permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(fs::read_dir(&ssh)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".authorized_keys.eiyah.")
+        }));
+        Ok(())
     }
 }
