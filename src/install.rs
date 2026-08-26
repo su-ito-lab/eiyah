@@ -10,6 +10,8 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+#[cfg(test)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +24,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    ResolvedPaths, discover_install_metadata, load_install_metadata, runtime_home,
+    ResolvedPaths, create_initial_config, create_install_metadata, discover_install_metadata,
+    load_config, load_install_metadata, resolve_paths, runtime_home,
 };
-use crate::transaction::LockGuard;
+use crate::transaction::{Action, LockGuard, PathIdentity, Transaction};
 
 // Public Releaseを取得するGitHub API endpoint
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/su-ito-lab/eiyah/releases/latest";
@@ -94,6 +97,11 @@ const SHOW_CAD_STATUS_DOWNLOAD_MODE: u32 = 0o600;
 const SHOW_CAD_STATUS_EXECUTABLE_MODE: u32 = 0o755;
 // authorized_keys temporary file名の衝突を避けるprocess内連番
 static AUTHORIZED_KEYS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Private archive attempt directoryの衝突を避けるprocess内連番
+static INSTALL_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// Private archive操作に使用するsystem tar
+const TAR_PATH: &str = "/usr/bin/tar";
 
 /// 更新に使用するstable Public Releaseの情報
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,6 +348,39 @@ pub fn create_eiyah_public_entry(paths: &ResolvedPaths, home: &Path) -> Result<P
 // Pixi Bootstrap
 // --------------------------------------------------
 
+/// Transactionへ即時記録する新規managed root
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedManagedRoot {
+    /// 新規作成したmanaged root path
+    pub path: PathBuf,
+    /// 作成直後のfilesystem identity
+    pub identity: PathIdentity,
+}
+
+/// Pixi installerとmanifest配置までを行いmanaged rootを返す
+pub fn prepare_pixi(paths: &ResolvedPaths, core_root: &Path) -> Result<CreatedManagedRoot> {
+    prepare_pixi_with(
+        paths,
+        core_root,
+        download_pixi_installer,
+        |_| Ok(()),
+        run_pixi_installer,
+        |command| command.output().map_err(Into::into),
+        PathIdentity::from_path,
+    )
+}
+
+/// prepared Pixi environmentをglobal manifestへ同期する
+pub fn sync_pixi(paths: &ResolvedPaths) -> Result<()> {
+    let home = runtime_home()?;
+    let binary = paths.pixi_home.join("bin/pixi");
+    let status = pixi_sync_command(&binary, &paths.pixi_home, &home).status()?;
+    if !status.success() {
+        bail!("pixi global sync failed: {status}");
+    }
+    Ok(())
+}
+
 /// official installerとPrivate manifestからEiyah専用Pixi環境を構築する
 pub fn bootstrap_pixi(paths: &ResolvedPaths, core_root: &Path) -> Result<()> {
     let home = runtime_home()?;
@@ -373,6 +414,41 @@ where
     Version: FnMut(&mut Command) -> Result<Output>,
     Sync: FnMut(&mut Command) -> Result<ExitStatus>,
 {
+    prepare_pixi_with(
+        paths,
+        core_root,
+        download,
+        before_home_create,
+        &mut install,
+        &mut version,
+        PathIdentity::from_path,
+    )?;
+    let pixi_binary = paths.pixi_home.join("bin/pixi");
+    let mut command = pixi_sync_command(&pixi_binary, &paths.pixi_home, home);
+    let status = sync(&mut command).context("failed to execute pixi global sync")?;
+    if !status.success() {
+        bail!("pixi global sync failed: {status}");
+    }
+    Ok(())
+}
+
+// sync開始前のPixi準備を完了しidentity取得失敗もowned root cleanup対象にする
+fn prepare_pixi_with<Download, BeforeHome, Installer, Version, Identity>(
+    paths: &ResolvedPaths,
+    core_root: &Path,
+    download: Download,
+    before_home_create: BeforeHome,
+    mut install: Installer,
+    mut version: Version,
+    identity: Identity,
+) -> Result<CreatedManagedRoot>
+where
+    Download: FnOnce(&str) -> Result<Vec<u8>>,
+    BeforeHome: FnOnce(&Path) -> Result<()>,
+    Installer: FnMut(&mut Command, &[u8]) -> Result<ExitStatus>,
+    Version: FnMut(&mut Command) -> Result<Output>,
+    Identity: FnOnce(&Path) -> Result<PathIdentity>,
+{
     let installer_script = download(PIXI_INSTALLER_URL)?;
     if installer_script.is_empty() {
         bail!("Pixi installer script is empty");
@@ -380,9 +456,8 @@ where
 
     before_home_create(&paths.pixi_home)?;
     let pixi_home_metadata = create_pixi_home(&paths.pixi_home)?;
-    let mut sync_started = false;
     let mut unowned_manifest_present = false;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<CreatedManagedRoot> {
         let mut installer = pixi_installer_command(&paths.pixi_home);
         let status = install(&mut installer, &installer_script)
             .context("failed to execute Pixi installer")?;
@@ -403,16 +478,13 @@ where
             return Err(error);
         }
 
-        let mut command = pixi_sync_command(&pixi_binary, &paths.pixi_home, home);
-        sync_started = true;
-        let status = sync(&mut command).context("failed to execute pixi global sync")?;
-        if !status.success() {
-            bail!("pixi global sync failed: {status}");
-        }
-        Ok(())
+        Ok(CreatedManagedRoot {
+            path: paths.pixi_home.clone(),
+            identity: identity(&paths.pixi_home)?,
+        })
     })();
 
-    if result.is_err() && !sync_started && !unowned_manifest_present {
+    if result.is_err() && !unowned_manifest_present {
         let _ = remove_owned_tree(&paths.pixi_home, &pixi_home_metadata);
     }
     result
@@ -670,6 +742,11 @@ pub fn backup_home_path(
         from: source.to_path_buf(),
         to: target,
     }))
+}
+
+// Private environment処理に先立ち固定backup rootを作成または検証する
+fn prepare_backup_root(state_home: &Path) -> Result<()> {
+    create_backup_directories(state_home, &state_home.join("eiyah/backup/home"))
 }
 
 // backup parentをmode 0700で作成しexisting directoryのpermissionを維持する
@@ -995,6 +1072,52 @@ pub fn run_stow(paths: &ResolvedPaths, home: &Path, packages: &[OsString]) -> Re
     })
 }
 
+/// 1 packageをStowし、失敗時は同packageをbest-effortでunstowする
+pub fn run_stow_package(paths: &ResolvedPaths, home: &Path, package: &OsStr) -> Result<()> {
+    run_stow_package_with(
+        paths,
+        home,
+        package,
+        |command| command.status().map_err(Into::into),
+        |command| command.status().map_err(Into::into),
+    )
+}
+
+// failed package cleanupを差し替え可能にしてoriginal Stow errorをprimaryに保つ
+fn run_stow_package_with(
+    paths: &ResolvedPaths,
+    home: &Path,
+    package: &OsStr,
+    execute: impl FnMut(&mut Command) -> Result<ExitStatus>,
+    cleanup: impl FnOnce(&mut Command) -> Result<ExitStatus>,
+) -> Result<()> {
+    let package_list = [package.to_os_string()];
+    if let Err(error) = run_stow_with(paths, home, &package_list, execute) {
+        let executable = paths.pixi_home.join("bin/stow");
+        let dotfiles = home.join(".dotfiles");
+        let mut command = Command::new(&executable);
+        command
+            .arg("--delete")
+            .arg("--target")
+            .arg(home)
+            .arg("--dir")
+            .arg(&dotfiles)
+            .arg(package)
+            .current_dir(&dotfiles)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        return match cleanup(&mut command) {
+            Ok(status) if status.success() => Err(error),
+            Ok(status) => Err(anyhow::anyhow!("{error:#}; failed Stow cleanup: {status}")),
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "{error:#}; failed Stow cleanup: {cleanup_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 // Stow実行を差し替え可能にしてargv・cwd contractを構成する
 fn run_stow_with(
     paths: &ResolvedPaths,
@@ -1249,6 +1372,512 @@ pub enum InstallState {
     Installed,
     /// artifactの不足または構造不整合がある状態
     Partial,
+}
+
+/// 展開済みPrivate archive rootとownership情報
+struct PrivateArchive {
+    // attempt directory
+    root: PathBuf,
+    // 後続helperへ渡す展開済みeiyah-core root
+    core_root: PathBuf,
+    // cleanup対象を限定するattempt root identity
+    metadata: fs::Metadata,
+}
+
+impl PrivateArchive {
+    // ownership確認付きでattempt rootをcleanupする
+    fn cleanup(&self) -> Result<()> {
+        remove_owned_tree(&self.root, &self.metadata).map_err(Into::into)
+    }
+}
+
+impl Drop for PrivateArchive {
+    // early returnでもattempt rootをbest-effort cleanupする
+    fn drop(&mut self) {
+        let _ = remove_owned_tree(&self.root, &self.metadata);
+    }
+}
+
+/// install開始前のhost・command・writeability条件を検証する
+pub fn install_preflight(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    if !home.is_absolute() || home.as_os_str().is_empty() {
+        bail!("HOME must be an absolute non-empty path");
+    }
+    let os_release = fs::read_to_string("/etc/os-release")?;
+    let id = os_release_value_from(&os_release, "ID");
+    let version = os_release_value_from(&os_release, "VERSION_ID");
+    if id.as_deref() != Some("almalinux")
+        || !version
+            .as_deref()
+            .is_some_and(|value| value.starts_with("8."))
+    {
+        bail!("Eiyah requires AlmaLinux 8.x");
+    }
+    if env::consts::ARCH != "x86_64" {
+        bail!("Eiyah requires x86_64");
+    }
+    let glibc = Command::new("getconf").arg("GNU_LIBC_VERSION").output()?;
+    let glibc_text = String::from_utf8(glibc.stdout)?;
+    let version = glibc_text.split_whitespace().last().unwrap_or("");
+    if !glibc.status.success() || !version_at_least(version, 2, 28) {
+        bail!("Eiyah requires glibc >= 2.28");
+    }
+    for (program, argument) in [("curl", "--version"), ("ssh", "-V"), ("ssh-keygen", "-V")] {
+        if Command::new(program)
+            .arg(argument)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            bail!("required command is unavailable: {program}");
+        }
+    }
+    for program in [BASH_PATH, TAR_PATH] {
+        validate_expected_executable(Path::new(program), "required command")?;
+    }
+    for path in [
+        home,
+        &paths.config_home,
+        &paths.data_home,
+        &paths.state_home,
+    ] {
+        validate_writable_directory(path)?;
+    }
+    Ok(())
+}
+
+// os-releaseのquoted/unquoted valueを取得する
+fn os_release_value_from(content: &str, name: &str) -> Option<String> {
+    let value = content
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}=")))?;
+    Some(value.trim_matches(['\'', '"']).to_owned())
+}
+
+// major.minor versionがminimum以上か判定する
+fn version_at_least(value: &str, major: u64, minor: u64) -> bool {
+    let mut fields = value.split('.');
+    let Some(actual_major) = fields.next().and_then(|field| field.parse().ok()) else {
+        return false;
+    };
+    let Some(actual_minor) = fields.next().and_then(|field| field.parse().ok()) else {
+        return false;
+    };
+    (actual_major, actual_minor) >= (major, minor)
+}
+
+// missing pathではnearest existing ancestorのwrite・search permissionを確認する
+fn validate_writable_directory(path: &Path) -> Result<()> {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    bail!(
+                        "writable path must be a non-symlink directory: {}",
+                        current.display()
+                    );
+                }
+                let path = CString::new(current.as_os_str().as_bytes())?;
+                // SAFETY: pathはNUL終端されcall中有効
+                if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current = current
+                    .parent()
+                    .context("writable path has no existing ancestor")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+// authenticated same-tag archiveをtemporary rootへstreamして安全に展開する
+fn download_private_archive(
+    paths: &ResolvedPaths,
+    token: &str,
+    url: &str,
+) -> Result<PrivateArchive> {
+    let parent = paths.state_home.join("eiyah/tmp");
+    create_install_directories(&parent)?;
+    let (root, metadata) = loop {
+        let sequence = INSTALL_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = parent.join(format!("install-{}-{sequence}", std::process::id()));
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&root) {
+            Ok(()) => {
+                let metadata = match fs::symlink_metadata(&root) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let _ = fs::remove_dir(&root);
+                        return Err(error.into());
+                    }
+                };
+                if let Err(error) = fs::set_permissions(&root, fs::Permissions::from_mode(0o700)) {
+                    let _ = remove_owned_tree(&root, &metadata);
+                    return Err(error.into());
+                }
+                break (root, metadata);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let archive = PrivateArchive {
+        core_root: root.join("core"),
+        root: root.clone(),
+        metadata,
+    };
+    let result = (|| -> Result<()> {
+        let archive_path = root.join("eiyah-core.tar.gz");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&archive_path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let agent = http_agent();
+        let mut response = private_request(&agent, url, token).call()?;
+        io::copy(&mut response.body_mut().as_reader(), &mut file)?;
+        file.sync_all()?;
+        extract_private_archive(&archive_path, &archive.core_root)
+    })();
+    result.map(|_| archive)
+}
+
+// inspected archiveをempty core directoryへ安全なtar optionで展開する
+fn extract_private_archive(archive: &Path, core_root: &Path) -> Result<()> {
+    inspect_archive(archive)?;
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(core_root)?;
+    fs::set_permissions(core_root, fs::Permissions::from_mode(0o700))?;
+    let status = Command::new(TAR_PATH)
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(core_root)
+        .arg("--strip-components=1")
+        .arg("--no-same-owner")
+        .arg("--no-same-permissions")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        bail!("Private archive extraction failed: {status}");
+    }
+    validate_non_symlink_directory(core_root, "Private archive root")
+}
+
+// tar listingのentry type・single top-level・path traversalを検証する
+fn inspect_archive(path: &Path) -> Result<()> {
+    let output = Command::new(TAR_PATH)
+        .arg("-tvzf")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("Private archive inspection failed: {}", output.status);
+    }
+    let listing = std::str::from_utf8(&output.stdout)?;
+    let mut top_level: Option<OsString> = None;
+    for line in listing.lines() {
+        let kind = line
+            .as_bytes()
+            .first()
+            .copied()
+            .context("empty archive listing entry")?;
+        if kind != b'-' && kind != b'd' {
+            bail!("unsupported Private archive entry");
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 {
+            bail!("invalid Private archive listing entry");
+        }
+        validate_archive_entry(Path::new(&fields[5..].join(" ")), &mut top_level)?;
+    }
+    if top_level.is_none() {
+        bail!("Private archive is empty");
+    }
+    Ok(())
+}
+
+// archive entryが単一top-level配下から脱出しないことを確認する
+fn validate_archive_entry(path: &Path, top_level: &mut Option<OsString>) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("invalid Private archive path");
+    }
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        bail!("invalid Private archive path");
+    };
+    if components.any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("Private archive path escapes top-level directory");
+    }
+    match top_level {
+        Some(expected) if expected != first => {
+            bail!("Private archive has multiple top-level directories")
+        }
+        None => *top_level = Some(first.to_os_string()),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Current Branchのinitial installまたはinstalled updateを実行する
+pub fn run_install() -> Result<()> {
+    let paths = resolve_paths()?;
+    let home = runtime_home()?;
+    install_preflight(&paths, &home)?;
+    let public_entry = home.join(".local/bin/eiyah");
+    let initial_state = detect_install_state(&paths, &public_entry)?;
+    route_install_state(
+        initial_state,
+        || LockGuard::acquire(&paths.state_home),
+        || detect_install_state(&paths, &public_entry),
+        || update_locked(&paths),
+        || install_not_installed_flow(&paths, &home),
+    )
+}
+
+// install状態をlock境界の契約どおりupdateまたはinitial installへ振り分ける
+fn route_install_state<Lock>(
+    initial_state: InstallState,
+    acquire_lock: impl FnOnce() -> Result<Lock>,
+    detect_locked_state: impl FnOnce() -> Result<InstallState>,
+    update: impl FnOnce() -> Result<()>,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if initial_state == InstallState::Partial {
+        bail!("Eiyah installation is partial");
+    }
+    let _lock = acquire_lock()?;
+    if initial_state == InstallState::Installed {
+        return update();
+    }
+    match detect_locked_state()? {
+        InstallState::Installed => update(),
+        InstallState::Partial => bail!("Eiyah installation is partial"),
+        InstallState::NotInstalled => install(),
+    }
+}
+
+// authenticated Private artifactを取得してtransaction境界内のinitial installを完了する
+fn install_not_installed_flow(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    let token = authorize_private_repository()?;
+    let release = fetch_private_release(&token)?;
+    let archive = download_private_archive(&paths, &token, &release.archive_url)?;
+    bootstrap_ssh(&home)?;
+    let mut transaction = Transaction::new();
+    complete_install_transaction(
+        &mut transaction,
+        |transaction| {
+            install_not_installed(
+                paths,
+                home,
+                &archive.core_root,
+                &token,
+                &release,
+                transaction,
+            )
+        },
+        || archive.cleanup(),
+        crate::print_warning,
+    )
+}
+
+// install結果に応じてcommitまたはrollbackしarchive cleanupを最後に実行する
+fn complete_install_transaction(
+    transaction: &mut Transaction,
+    install: impl FnOnce(&mut Transaction) -> Result<()>,
+    cleanup: impl FnOnce() -> Result<()>,
+    mut warn: impl FnMut(&str),
+) -> Result<()> {
+    let result = install(transaction);
+    match result {
+        Ok(()) => {
+            transaction.commit();
+            if let Err(error) = cleanup() {
+                warn(&format!(
+                    "failed to cleanup installation temporary files: {error:#}"
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let rollback = transaction.rollback();
+            let cleanup = cleanup();
+            let mut message = format!("{error:#}");
+            if let Err(rollback) = rollback {
+                message.push_str(&format!("; rollback failed: {rollback:#}"));
+            }
+            if let Err(cleanup) = cleanup {
+                message.push_str(&format!("; temporary cleanup failed: {cleanup:#}"));
+            }
+            bail!(message)
+        }
+    }
+}
+
+// lock取得済みNotInstalled stateへ全managed artifactを順序通り配置する
+fn install_not_installed(
+    paths: &ResolvedPaths,
+    home: &Path,
+    core_root: &Path,
+    token: &str,
+    release: &PrivateReleaseInfo,
+    transaction: &mut Transaction,
+) -> Result<()> {
+    for directory in [
+        paths.eiyah_prefix.clone(),
+        paths.eiyah_prefix.join("bin"),
+        home.join(".local/bin"),
+    ] {
+        for created in create_install_directories(&directory)? {
+            record_created(transaction, created, false)?;
+        }
+    }
+    install_running_eiyah_binary(paths)?;
+    record_created(transaction, paths.eiyah_prefix.join("bin/eiyah"), false)?;
+    let entry = create_eiyah_public_entry(paths, home)?;
+    record_created(transaction, entry, false)?;
+    create_install_metadata(paths)?;
+    record_created(transaction, paths.eiyah_prefix.join("install.toml"), false)?;
+
+    let pixi = prepare_pixi(paths, core_root)?;
+    transaction.record(Action::Created {
+        path: pixi.path,
+        identity: pixi.identity,
+        recursive: true,
+    });
+    sync_pixi(paths)?;
+
+    validate_private_source(core_root)?;
+    prepare_backup_root(&paths.state_home)?;
+    let dotfiles = home.join(".dotfiles");
+    if let Some(moved) = backup_home_path(home, &paths.state_home, &dotfiles)? {
+        transaction.record(Action::Moved {
+            from: moved.from,
+            to: moved.to,
+        });
+    }
+    let dotfiles = install_dotfiles(core_root, home)?;
+    record_created(transaction, dotfiles.clone(), true)?;
+    create_git_config_local(&dotfiles)?;
+    let packages = stow_packages(paths, &dotfiles)?;
+    for conflict in stow_conflicts(&dotfiles, home, &packages)? {
+        if let Some(moved) = backup_home_path(home, &paths.state_home, &conflict)? {
+            transaction.record(Action::Moved {
+                from: moved.from,
+                to: moved.to,
+            });
+        }
+    }
+    let stow = paths.pixi_home.join("bin/stow");
+    for package in &packages {
+        run_stow_package(paths, home, package)?;
+        transaction.record(Action::Stowed {
+            package: package.to_string_lossy().into_owned(),
+            executable: stow.clone(),
+            dir: dotfiles.clone(),
+            target: home.to_path_buf(),
+        });
+    }
+    validate_stowed_cshrc(&dotfiles, home)?;
+    let status = install_show_cad_status(
+        paths,
+        token,
+        release.show_cad_status_asset_id,
+        release.show_cad_status_checksum_asset_id,
+    )?;
+    record_created(transaction, status, false)?;
+    let status_entry = create_show_cad_status_entry(paths, home)?;
+    record_created(transaction, status_entry, false)?;
+    let config_parent = paths
+        .eiyah_config
+        .parent()
+        .context("config path has no parent")?;
+    for created in create_install_directories(config_parent)? {
+        record_created(transaction, created, false)?;
+    }
+    create_initial_config(paths)?;
+    record_created(transaction, paths.eiyah_config.clone(), false)?;
+    validate_installation(paths, home)
+}
+
+// path identityを取得してCreated Actionを即時記録する
+fn record_created(transaction: &mut Transaction, path: PathBuf, recursive: bool) -> Result<()> {
+    let identity = PathIdentity::from_path(&path)?;
+    transaction.record(Action::Created {
+        path,
+        identity,
+        recursive,
+    });
+    Ok(())
+}
+
+// commit前にinitial install artifactのfilesystem形状と内容を検証する
+fn validate_installation(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    validate_expected_executable(&paths.eiyah_prefix.join("bin/eiyah"), "Eiyah")?;
+    validate_absolute_entry(
+        &home.join(".local/bin/eiyah"),
+        &paths.eiyah_prefix.join("bin/eiyah"),
+    )?;
+    let metadata = load_install_metadata(&paths.eiyah_prefix.join("install.toml"))?;
+    if ResolvedPaths::from_install_metadata(metadata)? != *paths {
+        bail!("install metadata paths do not match initial paths");
+    }
+    validate_expected_executable(&paths.pixi_home.join("bin/pixi"), "Pixi")?;
+    validate_regular_non_symlink(
+        &paths.pixi_home.join("manifests/pixi-global.toml"),
+        "Pixi manifest",
+    )?;
+    validate_non_symlink_directory(&home.join(".dotfiles"), "dotfiles")?;
+    validate_stowed_cshrc(&home.join(".dotfiles"), home)?;
+    validate_expected_executable(
+        &paths.eiyah_prefix.join("bin/show-cad-status"),
+        "show-cad-status",
+    )?;
+    validate_absolute_entry(
+        &home.join(".local/bin/show-cad-status"),
+        &paths.eiyah_prefix.join("bin/show-cad-status"),
+    )?;
+    if !load_config(&paths.eiyah_config)?.show_cad_status {
+        bail!("initial config must enable show-cad-status");
+    }
+    Ok(())
+}
+
+// expected absolute symlink targetを検証する
+fn validate_absolute_entry(entry: &Path, expected: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(entry)?;
+    if !metadata.file_type().is_symlink()
+        || fs::read_link(entry)? != expected
+        || !expected.is_absolute()
+    {
+        bail!("invalid installed entry: {}", entry.display());
+    }
+    Ok(())
+}
+
+// non-symlink regular fileを検証する
+fn validate_regular_non_symlink(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("{label} must be a regular file: {}", path.display());
+    }
+    Ok(())
 }
 
 /// expected pathとpublic entryからinstall状態を判定する
@@ -2112,7 +2741,6 @@ mod tests {
     use std::io::Write;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3530,6 +4158,304 @@ mod tests {
     }
 
     #[test]
+    // identity確定失敗をprepare boundary内でowned PIXI_HOME cleanupへ含める
+    fn cleans_prepared_pixi_home_when_identity_capture_fails() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        create_core_manifest(&core_root, b"version = 1\n")?;
+
+        let result = prepare_pixi_with(
+            &paths,
+            &core_root,
+            |_| Ok(b"installer".to_vec()),
+            |_| Ok(()),
+            |_, _| {
+                create_test_pixi_binary(&paths)?;
+                Ok(ExitStatus::from_raw(0))
+            },
+            |_| Ok(ssh_keygen_output(0, b"pixi 0.50.0\n", b"")),
+            |_| Err(anyhow::anyhow!("injected identity failure")),
+        );
+
+        assert!(result.is_err());
+        assert!(!paths.pixi_home.exists());
+        Ok(())
+    }
+
+    #[test]
+    // failed Stow package cleanup errorよりoriginal Stow failureを先頭に保持する
+    fn keeps_original_stow_failure_primary_when_cleanup_fails() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let dotfiles = home.join(".dotfiles");
+        fs::create_dir_all(&dotfiles)?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"stow")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+
+        let error = run_stow_package_with(
+            &paths,
+            &home,
+            OsStr::new("git"),
+            |_| Ok(ExitStatus::from_raw(1 << 8)),
+            |_| Ok(ExitStatus::from_raw(2 << 8)),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.starts_with("Stow failed:"));
+        assert!(message.contains("failed Stow cleanup:"));
+        Ok(())
+    }
+
+    #[test]
+    // lock後state再確認をNotInstalled・Installed・Partialの各分岐で行う
+    fn routes_install_state_inside_existing_lock() -> Result<()> {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        route_install_state(
+            InstallState::Installed,
+            || {
+                events.borrow_mut().push("lock");
+                Ok(())
+            },
+            || unreachable!(),
+            || {
+                events.borrow_mut().push("update");
+                Ok(())
+            },
+            || unreachable!(),
+        )?;
+        assert_eq!(*events.borrow(), ["lock", "update"]);
+
+        for (locked_state, expected) in [
+            (InstallState::NotInstalled, "install"),
+            (InstallState::Installed, "update"),
+        ] {
+            let events = RefCell::new(Vec::new());
+            route_install_state(
+                InstallState::NotInstalled,
+                || {
+                    events.borrow_mut().push("lock");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("detect");
+                    Ok(locked_state)
+                },
+                || {
+                    events.borrow_mut().push("update");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("install");
+                    Ok(())
+                },
+            )?;
+            assert_eq!(*events.borrow(), ["lock", "detect", expected]);
+        }
+
+        let events = RefCell::new(Vec::new());
+        assert!(
+            route_install_state(
+                InstallState::NotInstalled,
+                || {
+                    events.borrow_mut().push("lock");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("detect");
+                    Ok(InstallState::Partial)
+                },
+                || unreachable!(),
+                || unreachable!(),
+            )
+            .is_err()
+        );
+        assert_eq!(*events.borrow(), ["lock", "detect"]);
+
+        assert!(
+            route_install_state(
+                InstallState::Partial,
+                || -> Result<()> { unreachable!() },
+                || unreachable!(),
+                || unreachable!(),
+                || unreachable!(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    // operation失敗時は即時記録済みActionを逆順rollback後にarchive cleanupする
+    fn rolls_back_actions_before_archive_cleanup_on_install_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let managed = directory.path.join("managed");
+        let child = managed.join("artifact");
+        let cleanup_observed = std::cell::Cell::new(false);
+        let mut transaction = Transaction::new();
+
+        let error = complete_install_transaction(
+            &mut transaction,
+            |transaction| {
+                fs::create_dir(&managed)?;
+                record_created(transaction, managed.clone(), false)?;
+                fs::write(&child, b"artifact")?;
+                record_created(transaction, child.clone(), false)?;
+                bail!("install validation failed")
+            },
+            || {
+                assert!(!child.exists());
+                assert!(!managed.exists());
+                cleanup_observed.set(true);
+                Ok(())
+            },
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").starts_with("install validation failed"));
+        assert!(cleanup_observed.get());
+        Ok(())
+    }
+
+    #[test]
+    // Pixi prepare成功直後のActionをsync failure時にtransaction rollbackする
+    fn rolls_back_prepared_pixi_after_sync_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        create_core_manifest(&core_root, b"version = 1\n")?;
+        let mut transaction = Transaction::new();
+
+        let error = complete_install_transaction(
+            &mut transaction,
+            |transaction| {
+                let pixi = prepare_pixi_with(
+                    &paths,
+                    &core_root,
+                    |_| Ok(b"installer".to_vec()),
+                    |_| Ok(()),
+                    |_, _| {
+                        create_test_pixi_binary(&paths)?;
+                        Ok(ExitStatus::from_raw(0))
+                    },
+                    |_| Ok(ssh_keygen_output(0, b"pixi 0.50.0\n", b"")),
+                    PathIdentity::from_path,
+                )?;
+                transaction.record(Action::Created {
+                    path: pixi.path,
+                    identity: pixi.identity,
+                    recursive: true,
+                });
+                bail!("pixi global sync failed")
+            },
+            || {
+                assert!(!paths.pixi_home.exists());
+                Ok(())
+            },
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").starts_with("pixi global sync failed"));
+        Ok(())
+    }
+
+    #[test]
+    // Stow途中失敗では先行packageだけをTransaction rollbackへ委ねる
+    fn rolls_back_prior_stow_package_after_later_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let executable = directory.path.join("stow");
+        let log = directory.path.join("unstow.log");
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$6\" >> {}\n", log.display()),
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let mut transaction = Transaction::new();
+
+        assert!(
+            complete_install_transaction(
+                &mut transaction,
+                |transaction| {
+                    transaction.record(Action::Stowed {
+                        package: "git".to_owned(),
+                        executable: executable.clone(),
+                        dir: directory.path.clone(),
+                        target: directory.path.clone(),
+                    });
+                    bail!("later Stow package failed")
+                },
+                || Ok(()),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(log)?, "git\n");
+        Ok(())
+    }
+
+    #[test]
+    // validation failureをrollbackしcommit後cleanup failureだけWarningへ変換する
+    fn applies_validation_commit_and_cleanup_boundaries() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let invalid = directory.path.join("invalid");
+        let mut transaction = Transaction::new();
+        assert!(
+            complete_install_transaction(
+                &mut transaction,
+                |transaction| {
+                    fs::write(&invalid, b"invalid")?;
+                    record_created(transaction, invalid.clone(), false)?;
+                    bail!("install validation failed")
+                },
+                || Ok(()),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(!invalid.exists());
+
+        let committed = directory.path.join("committed");
+        let warning = std::cell::RefCell::new(String::new());
+        complete_install_transaction(
+            &mut transaction,
+            |transaction| {
+                fs::write(&committed, b"committed")?;
+                record_created(transaction, committed.clone(), false)
+            },
+            || bail!("archive cleanup failed"),
+            |message| *warning.borrow_mut() = message.to_owned(),
+        )?;
+        assert!(committed.exists());
+        assert!(warning.borrow().contains("archive cleanup failed"));
+        Ok(())
+    }
+
+    #[test]
+    // dotfiles有無に依存せず固定backup rootを先に作成・検証する
+    fn prepares_private_environment_backup_root_without_dotfiles() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let state_home = directory.path.join("state");
+        fs::create_dir(&state_home)?;
+        prepare_backup_root(&state_home)?;
+        let backup_root = state_home.join("eiyah/backup/home");
+        assert!(backup_root.is_dir());
+        assert_eq!(
+            fs::metadata(backup_root)?.permissions().mode() & 0o777,
+            BACKUP_DIRECTORY_MODE
+        );
+        Ok(())
+    }
+
+    #[test]
     // Private sourceを検証してdotfilesのmode・content・symlinkを保持してcopyする
     fn installs_private_dotfiles_tree() -> Result<()> {
         let directory = TestDirectory::new()?;
@@ -3627,6 +4553,100 @@ mod tests {
         assert!(backup_home_path(&home, &state, &source).is_err());
         assert_eq!(fs::read(&source)?, b"original");
         assert!(!redirected.join("backup/home/.cshrc").exists());
+        Ok(())
+    }
+
+    #[test]
+    // Private archive pathのsingle top-levelとtraversal contractを検証する
+    fn validates_private_archive_entry_paths() -> Result<()> {
+        let mut top = None;
+        validate_archive_entry(Path::new("root/dotfiles/config"), &mut top)?;
+        validate_archive_entry(Path::new("root/pixi/manifest"), &mut top)?;
+        assert_eq!(top, Some(OsString::from("root")));
+        assert!(validate_archive_entry(Path::new("other/file"), &mut top).is_err());
+
+        let mut top = None;
+        assert!(validate_archive_entry(Path::new("/absolute"), &mut top).is_err());
+        assert!(validate_archive_entry(Path::new("root/../outside"), &mut top).is_err());
+        assert!(validate_archive_entry(Path::new(""), &mut top).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // local tar fixtureでinspection・strip extraction・unsupported symlink拒否を検証する
+    fn inspects_and_extracts_private_archive() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let staging = directory.path.join("staging");
+        let release = staging.join("release-root");
+        fs::create_dir_all(release.join("dotfiles"))?;
+        fs::write(release.join("dotfiles/config"), b"content")?;
+        let archive = directory.path.join("valid.tar.gz");
+        let status = Command::new(TAR_PATH)
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&staging)
+            .arg("release-root")
+            .status()?;
+        assert!(status.success());
+        let core = directory.path.join("core");
+        extract_private_archive(&archive, &core)?;
+        assert_eq!(fs::read(core.join("dotfiles/config"))?, b"content");
+
+        symlink("config", release.join("dotfiles/link"))?;
+        let invalid = directory.path.join("invalid.tar.gz");
+        let status = Command::new(TAR_PATH)
+            .arg("-czf")
+            .arg(&invalid)
+            .arg("-C")
+            .arg(&staging)
+            .arg("release-root")
+            .status()?;
+        assert!(status.success());
+        assert!(inspect_archive(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // commit前validationが全managed artifactとinitial configを確認する
+    fn validates_completed_installation() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        fs::create_dir_all(paths.eiyah_prefix.join("bin"))?;
+        fs::create_dir_all(paths.pixi_home.join("bin"))?;
+        fs::create_dir_all(paths.pixi_home.join("manifests"))?;
+        fs::create_dir_all(home.join(".local/bin"))?;
+        fs::create_dir_all(home.join(".dotfiles/tcsh"))?;
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+        for binary in [
+            paths.eiyah_prefix.join("bin/eiyah"),
+            paths.eiyah_prefix.join("bin/show-cad-status"),
+            paths.pixi_home.join("bin/pixi"),
+        ] {
+            fs::write(&binary, b"binary")?;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+        }
+        fs::write(
+            paths.pixi_home.join("manifests/pixi-global.toml"),
+            b"version = 1\n",
+        )?;
+        fs::write(home.join(".dotfiles/tcsh/.cshrc"), b"cshrc")?;
+        symlink(
+            &paths.eiyah_prefix.join("bin/eiyah"),
+            home.join(".local/bin/eiyah"),
+        )?;
+        symlink(
+            &paths.eiyah_prefix.join("bin/show-cad-status"),
+            home.join(".local/bin/show-cad-status"),
+        )?;
+        symlink(".dotfiles/tcsh/.cshrc", home.join(".cshrc"))?;
+        save_install_metadata(&paths)?;
+        fs::write(&paths.eiyah_config, b"show-cad-status = true\n")?;
+
+        validate_installation(&paths, &home)?;
+        fs::write(&paths.eiyah_config, b"show-cad-status = false\n")?;
+        assert!(validate_installation(&paths, &home).is_err());
         Ok(())
     }
 
