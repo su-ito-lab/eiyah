@@ -1637,8 +1637,8 @@ fn validate_archive_entry(path: &Path, top_level: &mut Option<OsString>) -> Resu
 
 /// Current Branchのinitial installまたはinstalled updateを実行する
 pub fn run_install() -> Result<()> {
-    let paths = resolve_paths()?;
     let home = runtime_home()?;
+    let paths = resolve_install_paths(&home)?;
     install_preflight(&paths, &home)?;
     let public_entry = home.join(".local/bin/eiyah");
     let initial_state = detect_install_state(&paths, &public_entry)?;
@@ -1649,6 +1649,29 @@ pub fn run_install() -> Result<()> {
         || update_locked(&paths),
         || install_not_installed_flow(&paths, &home),
     )
+}
+
+// existing installではpublic entry由来metadataを優先して配置pathを復元する
+fn resolve_install_paths(home: &Path) -> Result<ResolvedPaths> {
+    resolve_install_paths_with(home, resolve_paths)
+}
+
+// initial path解決を差し替え可能にしてinstalled operationのmetadata優先を保証する
+fn resolve_install_paths_with(
+    home: &Path,
+    resolve_initial: impl FnOnce() -> Result<ResolvedPaths>,
+) -> Result<ResolvedPaths> {
+    let public_entry = home.join(".local/bin/eiyah");
+    if !path_exists(&public_entry)? {
+        return resolve_initial();
+    }
+
+    let metadata_path = discover_install_metadata(&public_entry)
+        .context("Eiyah installation is partial: failed to discover install metadata")?;
+    let metadata = load_install_metadata(&metadata_path)
+        .context("Eiyah installation is partial: failed to load install metadata")?;
+    ResolvedPaths::from_install_metadata(metadata)
+        .context("Eiyah installation is partial: invalid install metadata paths")
 }
 
 // install状態をlock境界の契約どおりupdateまたはinitial installへ振り分ける
@@ -4288,6 +4311,83 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    // XDG相当のinitial pathが変わってもinstalled metadataのpathとlockを使用する
+    fn routes_installed_operation_with_metadata_paths_after_xdg_change() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let installed_paths = fixture_paths(&directory.path.join("installed"))?;
+        let changed_xdg_paths = fixture_paths(&directory.path.join("changed-xdg"))?;
+        let home = directory.path.join("home");
+        let public_entry = home.join(".local/bin/eiyah");
+        create_installed_fixture(&installed_paths, &public_entry)?;
+        let initial_resolver_called = std::cell::Cell::new(false);
+
+        let selected_paths = resolve_install_paths_with(&home, || {
+            initial_resolver_called.set(true);
+            Ok(changed_xdg_paths.clone())
+        })?;
+        let state = detect_install_state(&selected_paths, &public_entry)?;
+
+        assert!(!initial_resolver_called.get());
+        assert_eq!(selected_paths, installed_paths);
+        assert_eq!(state, InstallState::Installed);
+        route_install_state(
+            state,
+            || LockGuard::acquire(&selected_paths.state_home),
+            || unreachable!(),
+            || {
+                assert_eq!(selected_paths, installed_paths);
+                Ok(())
+            },
+            || unreachable!(),
+        )?;
+        assert!(installed_paths.state_home.join("eiyah/lock").is_file());
+        assert!(!changed_xdg_paths.state_home.join("eiyah/lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    // public entryがない未install時だけenvironment相当のinitial pathを使用する
+    fn resolves_environment_paths_only_for_initial_install() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+        let environment_paths = fixture_paths(&directory.path.join("environment"))?;
+        let resolver_called = std::cell::Cell::new(false);
+
+        let selected_paths = resolve_install_paths_with(&home, || {
+            resolver_called.set(true);
+            Ok(environment_paths.clone())
+        })?;
+        let state = detect_install_state(&selected_paths, &home.join(".local/bin/eiyah"))?;
+
+        assert!(resolver_called.get());
+        assert_eq!(selected_paths, environment_paths);
+        assert_eq!(state, InstallState::NotInstalled);
+        Ok(())
+    }
+
+    #[test]
+    // existing public entryのmetadata discovery failureをinitial installへfallbackしない
+    fn rejects_invalid_existing_public_entry_as_partial_install() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let public_entry = home.join(".local/bin/eiyah");
+        fs::create_dir_all(public_entry.parent().unwrap())?;
+        fs::write(&public_entry, b"not a symlink")?;
+        let resolver_called = std::cell::Cell::new(false);
+
+        let error = resolve_install_paths_with(&home, || {
+            resolver_called.set(true);
+            fixture_paths(&directory.path.join("environment"))
+        })
+        .unwrap_err();
+
+        assert!(!resolver_called.get());
+        assert!(format!("{error:#}").starts_with("Eiyah installation is partial:"));
         Ok(())
     }
 
