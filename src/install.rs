@@ -9,7 +9,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,6 +76,12 @@ const AUTHORIZED_KEYS_MODE: u32 = 0o600;
 const INSTALL_DIRECTORY_MODE: u32 = 0o755;
 // install済みEiyah binary permission
 const EIYAH_BINARY_MODE: u32 = 0o755;
+// Pixi official installer URL
+const PIXI_INSTALLER_URL: &str = "https://pixi.sh/install.sh";
+// Pixi installerを実行するsystem Bash
+const BASH_PATH: &str = "/usr/bin/bash";
+// Pixi global manifest fileのpermission
+const PIXI_MANIFEST_MODE: u32 = 0o644;
 // authorized_keys temporary file名の衝突を避けるprocess内連番
 static AUTHORIZED_KEYS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -318,6 +324,264 @@ pub fn create_eiyah_public_entry(paths: &ResolvedPaths, home: &Path) -> Result<P
         )
     })?;
     Ok(public_entry)
+}
+
+// --------------------------------------------------
+// Pixi Bootstrap
+// --------------------------------------------------
+
+/// official installerとPrivate manifestからEiyah専用Pixi環境を構築する
+pub fn bootstrap_pixi(paths: &ResolvedPaths, core_root: &Path) -> Result<()> {
+    let home = runtime_home()?;
+    bootstrap_pixi_with(
+        paths,
+        core_root,
+        &home,
+        download_pixi_installer,
+        |_| Ok(()),
+        run_pixi_installer,
+        |command| command.output().map_err(Into::into),
+        |command| command.status().map_err(Into::into),
+    )
+}
+
+// external I/Oを差し替え可能にしてPixi bootstrap contractを実行する
+fn bootstrap_pixi_with<Download, BeforeHome, Installer, Version, Sync>(
+    paths: &ResolvedPaths,
+    core_root: &Path,
+    home: &Path,
+    download: Download,
+    before_home_create: BeforeHome,
+    mut install: Installer,
+    mut version: Version,
+    mut sync: Sync,
+) -> Result<()>
+where
+    Download: FnOnce(&str) -> Result<Vec<u8>>,
+    BeforeHome: FnOnce(&Path) -> Result<()>,
+    Installer: FnMut(&mut Command, &[u8]) -> Result<ExitStatus>,
+    Version: FnMut(&mut Command) -> Result<Output>,
+    Sync: FnMut(&mut Command) -> Result<ExitStatus>,
+{
+    let installer_script = download(PIXI_INSTALLER_URL)?;
+    if installer_script.is_empty() {
+        bail!("Pixi installer script is empty");
+    }
+
+    before_home_create(&paths.pixi_home)?;
+    let pixi_home_metadata = create_pixi_home(&paths.pixi_home)?;
+    let mut sync_started = false;
+    let mut unowned_manifest_present = false;
+    let result = (|| -> Result<()> {
+        let mut installer = pixi_installer_command(&paths.pixi_home);
+        let status = install(&mut installer, &installer_script)
+            .context("failed to execute Pixi installer")?;
+        if !status.success() {
+            bail!("Pixi installer failed: {status}");
+        }
+
+        let pixi_binary = paths.pixi_home.join("bin/pixi");
+        validate_pixi_binary_with(&pixi_binary, &mut version)?;
+
+        let source_manifest = core_root.join("pixi/pixi-global.toml");
+        validate_pixi_manifest_source(&source_manifest)?;
+        let manifests = paths.pixi_home.join("manifests");
+        create_install_directories(&manifests)?;
+        let target_manifest = manifests.join("pixi-global.toml");
+        if let Err(error) = place_pixi_manifest(&source_manifest, &target_manifest) {
+            unowned_manifest_present = path_exists(&target_manifest)?;
+            return Err(error);
+        }
+
+        let mut command = pixi_sync_command(&pixi_binary, &paths.pixi_home, home);
+        sync_started = true;
+        let status = sync(&mut command).context("failed to execute pixi global sync")?;
+        if !status.success() {
+            bail!("pixi global sync failed: {status}");
+        }
+        Ok(())
+    })();
+
+    if result.is_err() && !sync_started && !unowned_manifest_present {
+        let _ = remove_owned_tree(&paths.pixi_home, &pixi_home_metadata);
+    }
+    result
+}
+
+// HTTPSからofficial installerをmemoryへ取得する
+fn download_pixi_installer(url: &str) -> Result<Vec<u8>> {
+    require_https_url(url)?;
+    let agent = http_agent();
+    let mut response = agent
+        .get(url)
+        .call()
+        .with_context(|| format!("failed to download Pixi installer: {url}"))?;
+    let mut script = Vec::new();
+    io::copy(&mut response.body_mut().as_reader(), &mut script)
+        .context("failed to read Pixi installer")?;
+    Ok(script)
+}
+
+// PIXI_HOMEを排他的に作成してcleanup用identityを返す
+fn create_pixi_home(path: &Path) -> Result<fs::Metadata> {
+    let mut builder = DirBuilder::new();
+    builder.mode(INSTALL_DIRECTORY_MODE);
+    builder
+        .create(path)
+        .with_context(|| format!("failed to create PIXI_HOME: {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect PIXI_HOME: {}", path.display()))?;
+    if let Err(error) =
+        fs::set_permissions(path, fs::Permissions::from_mode(INSTALL_DIRECTORY_MODE))
+    {
+        let _ = remove_owned_tree(path, &metadata);
+        return Err(error)
+            .with_context(|| format!("failed to set PIXI_HOME permissions: {}", path.display()));
+    }
+    Ok(metadata)
+}
+
+// identityが一致する今回作成分のtreeだけをcleanupする
+fn remove_owned_tree(path: &Path, created: &fs::Metadata) -> io::Result<()> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if same_inode(&current, created) {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+// installerへ固定environmentを渡しoverride用environmentを除去する
+fn pixi_installer_command(pixi_home: &Path) -> Command {
+    let mut command = Command::new(BASH_PATH);
+    command
+        .env("PIXI_HOME", pixi_home)
+        .env("PIXI_NO_PATH_UPDATE", "1");
+    for name in [
+        "PIXI_BIN_DIR",
+        "PIXI_VERSION",
+        "PIXI_ARCH",
+        "PIXI_DOWNLOAD_URL",
+        "PIXI_CACHE_DIR",
+        "RATTLER_CACHE_DIR",
+        "NETRC",
+        "TMP_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+// installer scriptをstdinへ渡してclose後に終了statusを待つ
+fn run_pixi_installer(command: &mut Command, script: &[u8]) -> Result<ExitStatus> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open Pixi installer stdin"))?;
+    let write_result = stdin.write_all(script);
+    drop(stdin);
+    let status = child.wait();
+    write_result?;
+    Ok(status?)
+}
+
+// expected Pixi binaryの形状とversion実行結果を検証する
+fn validate_pixi_binary_with(
+    path: &Path,
+    execute: &mut impl FnMut(&mut Command) -> Result<Output>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Pixi binary is unavailable: {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        bail!(
+            "Pixi binary must be a regular executable file: {}",
+            path.display()
+        );
+    }
+    let mut command = Command::new(path);
+    command.arg("--version");
+    let output = execute(&mut command)
+        .with_context(|| format!("failed to execute Pixi binary: {}", path.display()))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        bail!("Pixi binary validation failed: {}", path.display());
+    }
+    Ok(())
+}
+
+// Private root配下のmanifest sourceがnon-symlink regular fileであることを保証する
+fn validate_pixi_manifest_source(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Pixi manifest source is unavailable: {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "Pixi manifest source must be a regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// Private manifestをinitial targetへbyte-for-byteで配置する
+fn place_pixi_manifest(source: &Path, target: &Path) -> Result<()> {
+    place_pixi_manifest_with(source, target, |source, target| {
+        io::copy(source, target).map(|_| ())
+    })
+}
+
+// target作成直前のraceとcopy failureをtest可能にしてmanifestを配置する
+fn place_pixi_manifest_with<F>(source: &Path, target: &Path, mut copy: F) -> Result<()>
+where
+    F: FnMut(&mut File, &mut File) -> io::Result<()>,
+{
+    validate_pixi_manifest_source(source)?;
+    let mut source_file = File::open(source)?;
+    let mut target_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PIXI_MANIFEST_MODE)
+        .open(target)
+        .with_context(|| format!("failed to create Pixi manifest: {}", target.display()))?;
+    let created = target_file.metadata()?;
+    let result = (|| -> Result<()> {
+        target_file.set_permissions(fs::Permissions::from_mode(PIXI_MANIFEST_MODE))?;
+        copy(&mut source_file, &mut target_file)?;
+        target_file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(target_file);
+        let _ = remove_file_if_same_inode(target, &created);
+    }
+    result
+}
+
+// Pixi global syncをexpected binary・manifest home・working directoryへ固定する
+fn pixi_sync_command(pixi: &Path, pixi_home: &Path, home: &Path) -> Command {
+    let mut command = Command::new(pixi);
+    command
+        .arg("global")
+        .arg("sync")
+        .current_dir(home)
+        .env("PIXI_HOME", pixi_home)
+        .env("PIXI_NO_PATH_UPDATE", "1")
+        .env_remove("PIXI_BIN_DIR")
+        .env_remove("PIXI_CACHE_DIR")
+        .env_remove("RATTLER_CACHE_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
 }
 
 // GitHub Device code response
@@ -2362,6 +2626,342 @@ mod tests {
 
         assert!(create_eiyah_public_entry(&paths, &home).is_err());
         assert_eq!(fs::read(&public_entry)?, b"concurrent entry");
+        Ok(())
+    }
+
+    // commandで明示的に削除されたenvironment名を確認する
+    fn environment_is_removed(command: &Command, expected: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == expected && value.is_none())
+    }
+
+    // Pixi bootstrap test用Private manifestを作成する
+    fn create_core_manifest(root: &Path, contents: &[u8]) -> Result<PathBuf> {
+        let manifest = root.join("pixi/pixi-global.toml");
+        fs::create_dir_all(manifest.parent().unwrap())?;
+        fs::write(&manifest, contents)?;
+        Ok(manifest)
+    }
+
+    // test installerとしてexpected Pixi binaryを作成する
+    fn create_test_pixi_binary(paths: &ResolvedPaths) -> Result<()> {
+        let binary = paths.pixi_home.join("bin/pixi");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        fs::write(&binary, b"test pixi")?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    #[test]
+    // installer・binary validation・manifest配置・global sync contractを接続する
+    fn bootstraps_pixi_with_canonical_commands_and_manifest() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        let manifest_contents = b"version = 1\n";
+        create_core_manifest(&core_root, manifest_contents)?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+
+        bootstrap_pixi_with(
+            &paths,
+            &core_root,
+            &home,
+            |url| {
+                assert_eq!(url, PIXI_INSTALLER_URL);
+                Ok(b"#!/usr/bin/bash\n".to_vec())
+            },
+            |_| Ok(()),
+            |command, script| {
+                assert_eq!(command.get_program(), BASH_PATH);
+                assert_eq!(script, b"#!/usr/bin/bash\n");
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == "PIXI_HOME")
+                        .unwrap()
+                        .1,
+                    Some(paths.pixi_home.as_os_str())
+                );
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == "PIXI_NO_PATH_UPDATE")
+                        .unwrap()
+                        .1,
+                    Some(OsStr::new("1"))
+                );
+                for name in [
+                    "PIXI_BIN_DIR",
+                    "PIXI_VERSION",
+                    "PIXI_ARCH",
+                    "PIXI_DOWNLOAD_URL",
+                    "PIXI_CACHE_DIR",
+                    "RATTLER_CACHE_DIR",
+                    "NETRC",
+                    "TMP_DIR",
+                ] {
+                    assert!(environment_is_removed(command, name));
+                }
+                create_test_pixi_binary(&paths)?;
+                Ok(std::process::ExitStatus::from_raw(0))
+            },
+            |command| {
+                assert_eq!(command.get_program(), paths.pixi_home.join("bin/pixi"));
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    [OsStr::new("--version")]
+                );
+                Ok(ssh_keygen_output(0, b"pixi 0.50.0\n", b"ignored"))
+            },
+            |command| {
+                assert_eq!(command.get_program(), paths.pixi_home.join("bin/pixi"));
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    [OsStr::new("global"), OsStr::new("sync")]
+                );
+                assert_eq!(command.get_current_dir(), Some(home.as_path()));
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == "PIXI_HOME")
+                        .unwrap()
+                        .1,
+                    Some(paths.pixi_home.as_os_str())
+                );
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == "PIXI_NO_PATH_UPDATE")
+                        .unwrap()
+                        .1,
+                    Some(OsStr::new("1"))
+                );
+                for name in ["PIXI_BIN_DIR", "PIXI_CACHE_DIR", "RATTLER_CACHE_DIR"] {
+                    assert!(environment_is_removed(command, name));
+                }
+                Ok(std::process::ExitStatus::from_raw(0))
+            },
+        )?;
+
+        let manifest = paths.pixi_home.join("manifests/pixi-global.toml");
+        assert_eq!(fs::read(&manifest)?, manifest_contents);
+        assert_eq!(fs::metadata(&manifest)?.permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::metadata(paths.pixi_home.join("manifests"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&paths.pixi_home)?.permissions().mode() & 0o777,
+            0o755
+        );
+        Ok(())
+    }
+
+    #[test]
+    // PIXI_HOME作成raceで他者所有directoryを変更またはcleanupしない
+    fn preserves_pixi_home_created_during_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        let home = directory.path.join("home");
+
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(b"installer".to_vec()),
+                |pixi_home| {
+                    fs::create_dir(pixi_home)?;
+                    fs::set_permissions(pixi_home, fs::Permissions::from_mode(0o700))?;
+                    Ok(())
+                },
+                |_, _| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(paths.pixi_home.is_dir());
+        assert_eq!(
+            fs::metadata(&paths.pixi_home)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[test]
+    // empty installerはhome作成前に拒否しspawn failure後は所有homeをcleanupする
+    fn rejects_invalid_pixi_installer_without_leaving_home() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        let home = directory.path.join("home");
+
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(Vec::new()),
+                |_| Ok(()),
+                |_, _| unreachable!(),
+                |_| unreachable!(),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(!paths.pixi_home.exists());
+
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(b"installer".to_vec()),
+                |_| Ok(()),
+                |_, _| Err(anyhow::anyhow!("injected spawn failure")),
+                |_| unreachable!(),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(!paths.pixi_home.exists());
+        Ok(())
+    }
+
+    #[test]
+    // installer失敗時は所有PIXI_HOMEをcleanupしsync失敗時はrollback用に保持する
+    fn applies_pixi_cleanup_boundary_at_global_sync() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        create_core_manifest(&core_root, b"version = 1\n")?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(b"installer".to_vec()),
+                |_| Ok(()),
+                |_, _| Ok(std::process::ExitStatus::from_raw(1 << 8)),
+                |_| unreachable!(),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(!paths.pixi_home.exists());
+
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(b"installer".to_vec()),
+                |_| Ok(()),
+                |_, _| {
+                    create_test_pixi_binary(&paths)?;
+                    Ok(std::process::ExitStatus::from_raw(0))
+                },
+                |_| Ok(ssh_keygen_output(0, b"pixi 0.50.0\n", b"")),
+                |_| Ok(std::process::ExitStatus::from_raw(1 << 8)),
+            )
+            .is_err()
+        );
+        assert!(paths.pixi_home.is_dir());
+        assert!(paths.pixi_home.join("manifests/pixi-global.toml").is_file());
+        Ok(())
+    }
+
+    #[test]
+    // Pixi binaryとPrivate manifest sourceの不正なfilesystem形状を拒否する
+    fn rejects_invalid_pixi_binary_and_manifest_source() -> Result<()> {
+        fn unexpected_execution(_: &mut Command) -> Result<Output> {
+            unreachable!()
+        }
+
+        let directory = TestDirectory::new()?;
+        let binary = directory.path.join("pixi");
+        fs::write(&binary, b"pixi")?;
+        let mut execute = unexpected_execution;
+        assert!(validate_pixi_binary_with(&binary, &mut execute).is_err());
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+        let mut failed = |_: &mut Command| Ok(ssh_keygen_output(1, b"pixi 0.50.0\n", b""));
+        assert!(validate_pixi_binary_with(&binary, &mut failed).is_err());
+        let mut empty = |_: &mut Command| Ok(ssh_keygen_output(0, b"", b"ignored"));
+        assert!(validate_pixi_binary_with(&binary, &mut empty).is_err());
+        let link = directory.path.join("pixi-link");
+        symlink(&binary, &link)?;
+        assert!(validate_pixi_binary_with(&link, &mut execute).is_err());
+
+        let missing = directory.path.join("missing-manifest");
+        assert!(validate_pixi_manifest_source(&missing).is_err());
+        let manifest_link = directory.path.join("manifest-link");
+        symlink(&binary, &manifest_link)?;
+        assert!(validate_pixi_manifest_source(&manifest_link).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // manifest衝突とcopy失敗で他者所有pathを変更せずpartial targetだけをcleanupする
+    fn preserves_existing_pixi_manifest_and_cleans_partial_copy() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source.toml");
+        let target = directory.path.join("target.toml");
+        fs::write(&source, b"version = 1\n")?;
+        fs::write(&target, b"concurrent manifest")?;
+        assert!(place_pixi_manifest(&source, &target).is_err());
+        assert_eq!(fs::read(&target)?, b"concurrent manifest");
+
+        fs::remove_file(&target)?;
+        assert!(
+            place_pixi_manifest_with(&source, &target, |_, target| {
+                target.write_all(b"partial")?;
+                Err(io::Error::other("injected copy failure"))
+            })
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read(&source)?, b"version = 1\n");
+
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let core_root = directory.path.join("core");
+        create_core_manifest(&core_root, b"version = 1\n")?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+        let raced_manifest = paths.pixi_home.join("manifests/pixi-global.toml");
+        assert!(
+            bootstrap_pixi_with(
+                &paths,
+                &core_root,
+                &home,
+                |_| Ok(b"installer".to_vec()),
+                |_| Ok(()),
+                |_, _| {
+                    create_test_pixi_binary(&paths)?;
+                    fs::create_dir(paths.pixi_home.join("manifests"))?;
+                    fs::write(&raced_manifest, b"concurrent manifest")?;
+                    Ok(std::process::ExitStatus::from_raw(0))
+                },
+                |_| Ok(ssh_keygen_output(0, b"pixi 0.50.0\n", b"")),
+                |_| unreachable!(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&raced_manifest)?, b"concurrent manifest");
         Ok(())
     }
 }
