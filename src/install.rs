@@ -5,10 +5,10 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -72,6 +72,10 @@ const SSH_PRIVATE_KEY_MODE: u32 = 0o600;
 const SSH_PUBLIC_KEY_MODE: u32 = 0o644;
 // Eiyahが新規作成するauthorized_keys permission
 const AUTHORIZED_KEYS_MODE: u32 = 0o600;
+// Eiyahが新規作成するinstall directory permission
+const INSTALL_DIRECTORY_MODE: u32 = 0o755;
+// install済みEiyah binary permission
+const EIYAH_BINARY_MODE: u32 = 0o755;
 // authorized_keys temporary file名の衝突を避けるprocess内連番
 static AUTHORIZED_KEYS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -97,6 +101,223 @@ pub struct PrivateReleaseInfo {
     pub show_cad_status_asset_id: u64,
     /// show-cad-status checksum assetのGitHub ID
     pub show_cad_status_checksum_asset_id: u64,
+}
+
+// --------------------------------------------------
+// Eiyah Installation Paths
+// --------------------------------------------------
+
+/// 初回installで作成した管理対象directoryだけを作成順で返す
+pub fn create_install_directories(path: &Path) -> Result<Vec<PathBuf>> {
+    create_install_directories_with(path, |_| Ok(()))
+}
+
+// 各directory作成直前のraceをtest可能にしてmissing pathを排他的に作成する
+fn create_install_directories_with<F>(path: &Path, mut before_create: F) -> Result<Vec<PathBuf>>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().with_context(|| {
+                    format!("install path has no existing ancestor: {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect install directory: {}", current.display())
+                });
+            }
+        }
+    }
+    missing.reverse();
+
+    let mut created = Vec::new();
+    let result = (|| -> Result<()> {
+        for directory in missing {
+            before_create(&directory)?;
+            let mut builder = DirBuilder::new();
+            builder.mode(INSTALL_DIRECTORY_MODE);
+            match builder.create(&directory) {
+                Ok(()) => {
+                    let metadata = fs::symlink_metadata(&directory).with_context(|| {
+                        format!(
+                            "failed to inspect created install directory: {}",
+                            directory.display()
+                        )
+                    })?;
+                    created.push((directory.clone(), metadata));
+                    fs::set_permissions(
+                        &directory,
+                        fs::Permissions::from_mode(INSTALL_DIRECTORY_MODE),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to set install directory permissions: {}",
+                            directory.display()
+                        )
+                    })?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    validate_install_directory(&directory)?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create install directory: {}",
+                            directory.display()
+                        )
+                    });
+                }
+            }
+        }
+        validate_install_directory(path)
+    })();
+
+    if let Err(error) = result {
+        for (directory, metadata) in created.iter().rev() {
+            let _ = remove_directory_if_same_inode(directory, metadata);
+        }
+        return Err(error);
+    }
+    Ok(created.into_iter().map(|(path, _)| path).collect())
+}
+
+// managed pathが既存のnon-symlink directoryであることを保証する
+fn validate_install_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect install directory: {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "install path must be a non-symlink directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// pathが作成時と同じdirectory inodeを指す場合だけcleanupする
+fn remove_directory_if_same_inode(path: &Path, created: &fs::Metadata) -> io::Result<()> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if same_inode(&current, created) {
+        fs::remove_dir(path)?;
+    }
+    Ok(())
+}
+
+/// 実行中のEiyah binaryを初回install targetへ配置する
+pub fn install_running_eiyah_binary(paths: &ResolvedPaths) -> Result<()> {
+    let source = env::current_exe().context("failed to resolve running Eiyah executable")?;
+    install_eiyah_binary_from(paths, &source)
+}
+
+// 指定sourceを使用してbinary配置contractを検証する
+fn install_eiyah_binary_from(paths: &ResolvedPaths, source: &Path) -> Result<()> {
+    install_eiyah_binary_with(paths, source, |source, target| io::copy(source, target))
+}
+
+// copy失敗時のcleanupを含めてEiyah binaryを配置する
+fn install_eiyah_binary_with<F>(paths: &ResolvedPaths, source: &Path, copy: F) -> Result<()>
+where
+    F: FnOnce(&mut File, &mut File) -> io::Result<u64>,
+{
+    validate_source_binary(source)?;
+    let target = paths.eiyah_prefix.join("bin/eiyah");
+    let mut source_file = File::open(source)
+        .with_context(|| format!("failed to open source Eiyah binary: {}", source.display()))?;
+    let mut target_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(EIYAH_BINARY_MODE)
+        .open(&target)
+        .with_context(|| format!("failed to create Eiyah binary: {}", target.display()))?;
+    // cleanup対象を今回create_newしたinodeへ限定するためのidentity
+    let created_target = target_file
+        .metadata()
+        .with_context(|| format!("failed to inspect Eiyah binary: {}", target.display()))?;
+
+    let result = (|| -> Result<()> {
+        target_file
+            .set_permissions(fs::Permissions::from_mode(EIYAH_BINARY_MODE))
+            .with_context(|| format!("failed to set Eiyah binary mode: {}", target.display()))?;
+        copy(&mut source_file, &mut target_file)
+            .with_context(|| format!("failed to copy Eiyah binary: {}", target.display()))?;
+        target_file
+            .sync_all()
+            .with_context(|| format!("failed to sync Eiyah binary: {}", target.display()))
+    })();
+
+    if result.is_err() {
+        drop(target_file);
+        let _ = remove_file_if_same_inode(&target, &created_target);
+    }
+    result
+}
+
+// pathが作成時と同じinodeを指す場合だけpartial fileをcleanupする
+fn remove_file_if_same_inode(path: &Path, created: &fs::Metadata) -> io::Result<()> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if same_inode(&current, created) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+// filesystem deviceとinodeで今回作成したpathを識別する
+fn same_inode(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+// sourceがsymlinkでない実行可能なregular fileであることを保証する
+fn validate_source_binary(source: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source).with_context(|| {
+        format!(
+            "failed to inspect source Eiyah binary: {}",
+            source.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "source Eiyah binary must be a regular file: {}",
+            source.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        bail!(
+            "source Eiyah binary must be executable: {}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+/// HOME配下へinstalled binaryを指すabsolute public symlinkを作成する
+pub fn create_eiyah_public_entry(paths: &ResolvedPaths, home: &Path) -> Result<PathBuf> {
+    let target = paths.eiyah_prefix.join("bin/eiyah");
+    if !target.is_absolute() {
+        bail!("public entry target must be absolute: {}", target.display());
+    }
+    let public_entry = home.join(".local/bin/eiyah");
+    symlink(&target, &public_entry).with_context(|| {
+        format!(
+            "failed to create public Eiyah entry: {}",
+            public_entry.display()
+        )
+    })?;
+    Ok(public_entry)
 }
 
 // GitHub Device code response
@@ -1975,6 +2196,172 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".authorized_keys.eiyah.")
         }));
+        Ok(())
+    }
+
+    #[test]
+    // managed directoryをmode 0755で作成し既存directoryのpermissionは維持する
+    fn creates_and_reuses_install_directories() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let managed = directory.path.join("missing-parent/managed");
+        assert_eq!(
+            create_install_directories(&managed)?,
+            vec![directory.path.join("missing-parent"), managed.clone()]
+        );
+        assert_eq!(fs::metadata(&managed)?.permissions().mode() & 0o777, 0o755);
+
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o750))?;
+        assert!(create_install_directories(&managed)?.is_empty());
+        assert_eq!(fs::metadata(&managed)?.permissions().mode() & 0o777, 0o750);
+        Ok(())
+    }
+
+    #[test]
+    // managed directory位置のsymlinkとnon-directoryを拒否する
+    fn rejects_invalid_install_directory_paths() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let regular = directory.path.join("regular");
+        fs::write(&regular, b"file")?;
+        assert!(create_install_directories(&regular).is_err());
+
+        let actual = directory.path.join("actual");
+        let link = directory.path.join("link");
+        fs::create_dir(&actual)?;
+        symlink(&actual, &link)?;
+        assert!(create_install_directories(&link).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // 作成直前に他process相当で出現したdirectoryを所有せずpermissionも維持する
+    fn preserves_directory_created_during_install_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let managed = directory.path.join("managed");
+
+        let created = create_install_directories_with(&managed, |path| {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            Ok(())
+        })?;
+
+        assert!(created.is_empty());
+        assert_eq!(fs::metadata(&managed)?.permissions().mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    // source binaryがregular executableであることを検証する
+    fn validates_eiyah_install_source() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source");
+        fs::write(&source, b"binary")?;
+        assert!(validate_source_binary(&source).is_err());
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+        validate_source_binary(&source)?;
+
+        let link = directory.path.join("source-link");
+        symlink(&source, &link)?;
+        assert!(validate_source_binary(&link).is_err());
+        assert!(validate_source_binary(&directory.path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // Eiyah binaryをsource内容とmode 0755で新規配置し既存targetを拒否する
+    fn installs_eiyah_binary_without_replacement() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let binary_directory = paths.eiyah_prefix.join("bin");
+        fs::create_dir_all(&binary_directory)?;
+        let source = directory.path.join("source-eiyah");
+        fs::write(&source, b"running eiyah")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+
+        install_eiyah_binary_from(&paths, &source)?;
+
+        let target = binary_directory.join("eiyah");
+        assert_eq!(fs::read(&target)?, b"running eiyah");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o755);
+        assert!(install_eiyah_binary_from(&paths, &source).is_err());
+        assert_eq!(fs::read(&target)?, b"running eiyah");
+        Ok(())
+    }
+
+    #[test]
+    // binary copy失敗時に今回作成したpartial targetだけをcleanupする
+    fn cleans_partial_eiyah_binary_after_copy_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(paths.eiyah_prefix.join("bin"))?;
+        let source = directory.path.join("source-eiyah");
+        fs::write(&source, b"running eiyah")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+
+        assert!(
+            install_eiyah_binary_with(&paths, &source, |_, target| {
+                target.write_all(b"partial")?;
+                Err(io::Error::other("injected copy failure"))
+            })
+            .is_err()
+        );
+        assert!(!paths.eiyah_prefix.join("bin/eiyah").exists());
+        assert_eq!(fs::read(&source)?, b"running eiyah");
+        Ok(())
+    }
+
+    #[test]
+    // copy失敗前に置換された他者所有targetをcleanupしない
+    fn preserves_replaced_eiyah_target_after_copy_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let binary_directory = paths.eiyah_prefix.join("bin");
+        fs::create_dir_all(&binary_directory)?;
+        let source = directory.path.join("source-eiyah");
+        fs::write(&source, b"running eiyah")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+        let target = binary_directory.join("eiyah");
+
+        assert!(
+            install_eiyah_binary_with(&paths, &source, |_, _| {
+                fs::remove_file(&target)?;
+                fs::write(&target, b"concurrent target")?;
+                Err(io::Error::other("injected copy failure"))
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&target)?, b"concurrent target");
+        Ok(())
+    }
+
+    #[test]
+    // public entryをinstalled binaryへのabsolute symlinkとして新規作成する
+    fn creates_absolute_eiyah_public_entry() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        fs::create_dir_all(home.join(".local/bin"))?;
+
+        let public_entry = create_eiyah_public_entry(&paths, &home)?;
+
+        let target = fs::read_link(&public_entry)?;
+        assert!(target.is_absolute());
+        assert_eq!(target, paths.eiyah_prefix.join("bin/eiyah"));
+        Ok(())
+    }
+
+    #[test]
+    // public entry衝突時に既存pathを変更またはcleanupしない
+    fn preserves_existing_eiyah_public_entry() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let public_entry = home.join(".local/bin/eiyah");
+        fs::create_dir_all(public_entry.parent().unwrap())?;
+        fs::write(&public_entry, b"concurrent entry")?;
+
+        assert!(create_eiyah_public_entry(&paths, &home).is_err());
+        assert_eq!(fs::read(&public_entry)?, b"concurrent entry");
         Ok(())
     }
 }
