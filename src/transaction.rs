@@ -3,14 +3,13 @@
 // @brief Transaction action tracking and rollback
 // ==================================================
 
-use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,7 +19,14 @@ use anyhow::{Result, anyhow, bail};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     /// transaction中に新規作成したpath
-    Created(PathBuf),
+    Created {
+        /// 作成したpath
+        path: PathBuf,
+        /// Action記録時点のidentity
+        identity: PathIdentity,
+        /// managed root全体をrollback対象にするか
+        recursive: bool,
+    },
     /// transaction中に移動したpathと移動先
     Moved {
         /// move前のpath
@@ -29,7 +35,41 @@ pub enum Action {
         to: PathBuf,
     },
     /// transaction中にStowしたpackage名
-    Stowed(String),
+    Stowed {
+        /// Stow済みpackage名
+        package: String,
+        /// 実行に使用したabsolute Stow path
+        executable: PathBuf,
+        /// Stow source root
+        dir: PathBuf,
+        /// Stow target root
+        target: PathBuf,
+    },
+}
+
+/// rollback対象pathの作成時filesystem identity
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathIdentity {
+    /// Unix device number
+    pub device: u64,
+    /// Unix inode number
+    pub inode: u64,
+}
+
+impl PathIdentity {
+    /// symlinkをfollowせず現在のpath identityを取得する
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    // 記録済みidentityと現在のmetadataを比較する
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        self.device == metadata.dev() && self.inode == metadata.ino()
+    }
 }
 
 /// 成功済みoperationをrollbackまで逆順に保持するtransaction
@@ -68,7 +108,10 @@ impl Transaction {
     }
 
     // Stow解除処理を差し替え可能にして全actionのundoを継続する
-    fn rollback_with(&mut self, mut unstow: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    fn rollback_with(
+        &mut self,
+        mut unstow: impl FnMut(&str, &Path, &Path, &Path) -> Result<()>,
+    ) -> Result<()> {
         // 失敗後も残りのundoを継続するため、各errorを最後まで保持する
         let mut errors = Vec::new();
 
@@ -137,24 +180,41 @@ impl Drop for LockGuard {
 }
 
 // Action variantごとのfilesystemまたはStow変更を取り消す
-fn undo(action: Action, unstow: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+fn undo(
+    action: Action,
+    unstow: &mut impl FnMut(&str, &Path, &Path, &Path) -> Result<()>,
+) -> Result<()> {
     match action {
-        Action::Created(path) => remove_created_path(&path),
+        Action::Created {
+            path,
+            identity,
+            recursive,
+        } => remove_created_path(&path, identity, recursive),
         Action::Moved { from, to } => restore_moved_path(&from, &to),
-        Action::Stowed(package) => unstow(&package),
+        Action::Stowed {
+            package,
+            executable,
+            dir,
+            target,
+        } => unstow(&package, &executable, &dir, &target),
     }
 }
 
 // 作成済みpathをfile typeに応じて削除する
-fn remove_created_path(path: &Path) -> Result<()> {
+fn remove_created_path(path: &Path, identity: PathIdentity, recursive: bool) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
 
-    if metadata.file_type().is_dir() {
+    if !identity.matches(&metadata) {
+        bail!("created path identity changed: {}", path.display());
+    }
+    if metadata.file_type().is_dir() && recursive {
         fs::remove_dir_all(path)?;
+    } else if metadata.file_type().is_dir() {
+        fs::remove_dir(path)?;
     } else {
         fs::remove_file(path)?;
     }
@@ -190,19 +250,8 @@ fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
 }
 
 // Stow済みpackageを固定したsource / target rootから解除する
-fn unstow_package(package: &str) -> Result<()> {
-    // working directoryへ依存しないStow targetの基準path
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is not set"))?;
-    if home.as_os_str().is_empty() {
-        bail!("HOME must not be empty");
-    }
-    if !home.is_absolute() {
-        bail!("HOME must be an absolute path: {}", home.display());
-    }
-
-    let status = build_unstow_command(package, &home).status()?;
+fn unstow_package(package: &str, executable: &Path, dir: &Path, target: &Path) -> Result<()> {
+    let status = build_unstow_command(package, executable, dir, target).status()?;
     if !status.success() {
         bail!("stow --delete failed for package {package}: {status}");
     }
@@ -210,17 +259,19 @@ fn unstow_package(package: &str) -> Result<()> {
 }
 
 // working directory非依存のStow delete commandを構成する
-fn build_unstow_command(package: &str, home: &Path) -> Command {
-    // install済みPrivate dotfilesを保持するStow source root
-    let source_root = home.join(".dotfiles");
-    let mut command = Command::new("stow");
+fn build_unstow_command(package: &str, executable: &Path, dir: &Path, target: &Path) -> Command {
+    let mut command = Command::new(executable);
     command
         .arg("--delete")
-        .arg("--dir")
-        .arg(&source_root)
         .arg("--target")
-        .arg(&home)
-        .arg(package);
+        .arg(target)
+        .arg("--dir")
+        .arg(dir)
+        .arg(package)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
     command
 }
 
@@ -230,10 +281,30 @@ fn build_unstow_command(package: &str, home: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::ffi::{OsStr, OsString};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    // test pathをidentity付きCreated Actionへ変換する
+    fn created_action(path: &Path) -> Result<Action> {
+        Ok(Action::Created {
+            path: path.to_path_buf(),
+            identity: PathIdentity::from_path(path)?,
+            recursive: false,
+        })
+    }
+
+    // test用のabsolute Stow contextを持つActionを作成する
+    fn stowed_action(package: &str) -> Action {
+        Action::Stowed {
+            package: package.to_owned(),
+            executable: PathBuf::from("/opt/pixi/bin/stow"),
+            dir: PathBuf::from("/home/tester/.dotfiles"),
+            target: PathBuf::from("/home/tester"),
+        }
+    }
 
     // 並列test間でtemporary directory名が衝突しないための連番
     static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -278,10 +349,28 @@ mod tests {
         fs::write(&created, b"created")?;
 
         let mut transaction = Transaction::new();
-        transaction.record(Action::Created(created.clone()));
+        transaction.record(created_action(&created)?);
         transaction.rollback()?;
 
         assert!(!created.exists());
+        Ok(())
+    }
+
+    #[test]
+    // Created pathが他者所有inodeへ置換された場合は削除しない
+    fn created_action_rejects_identity_mismatch() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let created = directory.path.join("created");
+        fs::write(&created, b"owned")?;
+        let action = created_action(&created)?;
+        let replacement = directory.path.join("replacement");
+        fs::write(&replacement, b"replacement")?;
+        fs::rename(&replacement, &created)?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(action);
+        assert!(transaction.rollback().is_err());
+        assert_eq!(fs::read(&created)?, b"replacement");
         Ok(())
     }
 
@@ -310,25 +399,30 @@ mod tests {
     // Stowed actionがpackageを明示rootでunstowすることを検証する
     fn stowed_action_uses_explicit_source_and_target_roots() -> Result<()> {
         let mut transaction = Transaction::new();
-        transaction.record(Action::Stowed("zsh".to_owned()));
+        transaction.record(stowed_action("zsh"));
         let mut packages = Vec::new();
-        transaction.rollback_with(|package| {
+        transaction.rollback_with(|package, _, _, _| {
             packages.push(package.to_owned());
             Ok(())
         })?;
         assert_eq!(packages, ["zsh"]);
 
-        let command = build_unstow_command("zsh", Path::new("/home/tester"));
+        let command = build_unstow_command(
+            "zsh",
+            Path::new("/opt/pixi/bin/stow"),
+            Path::new("/home/tester/.dotfiles"),
+            Path::new("/home/tester"),
+        );
         let arguments: Vec<OsString> = command.get_args().map(OsString::from).collect();
-        assert_eq!(command.get_program(), OsStr::new("stow"));
+        assert_eq!(command.get_program(), OsStr::new("/opt/pixi/bin/stow"));
         assert_eq!(
             arguments,
             [
                 "--delete",
-                "--dir",
-                "/home/tester/.dotfiles",
                 "--target",
                 "/home/tester",
+                "--dir",
+                "/home/tester/.dotfiles",
                 "zsh",
             ]
             .map(OsString::from)
@@ -341,10 +435,10 @@ mod tests {
     fn rollback_uses_reverse_action_order() -> Result<()> {
         let mut transaction = Transaction::new();
         for package in ["first", "second", "third"] {
-            transaction.record(Action::Stowed(package.to_owned()));
+            transaction.record(stowed_action(package));
         }
         let mut packages = Vec::new();
-        transaction.rollback_with(|package| {
+        transaction.rollback_with(|package, _, _, _| {
             packages.push(package.to_owned());
             Ok(())
         })?;
@@ -411,7 +505,7 @@ mod tests {
         fs::write(&created, b"created")?;
 
         let mut transaction = Transaction::new();
-        transaction.record(Action::Created(created.clone()));
+        transaction.record(created_action(&created)?);
         transaction.record(Action::Moved {
             from: directory.path.join("original"),
             to: directory.path.join("missing"),
@@ -449,7 +543,7 @@ mod tests {
         fs::write(&created, b"created")?;
 
         let mut transaction = Transaction::new();
-        transaction.record(Action::Created(created.clone()));
+        transaction.record(created_action(&created)?);
         transaction.commit();
         transaction.rollback()?;
 

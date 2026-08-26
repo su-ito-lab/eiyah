@@ -27,7 +27,7 @@ use config::{
     runtime_home, set_show_cad_status,
 };
 use handoff::{run_handoff, run_show_cad_status_enabled};
-use install::run_update;
+use install::{run_install, run_update};
 
 // 実装済みのPublic / Internal CLI
 #[derive(Debug, Parser)]
@@ -41,6 +41,9 @@ struct Cli {
 // 現在本実装を持つcommand
 #[derive(Debug, Subcommand)]
 enum Command {
+    // bootstrap binaryからinitial installを実行するinternal command
+    #[command(name = "__install", hide = true)]
+    Install,
     // Public ReleaseからEiyah binaryを更新する
     Update,
     // Eiyahとsystem configurationを表示する
@@ -85,6 +88,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     run_with(
         cli,
+        run_install,
         run_update,
         run_handoff,
         run_show_cad_status_enabled,
@@ -96,6 +100,7 @@ fn run(cli: Cli) -> Result<u8> {
 // command dependencyを差し替え可能にしてCLI dispatchを実行する
 fn run_with(
     cli: Cli,
+    mut install: impl FnMut() -> Result<()>,
     mut update: impl FnMut() -> Result<()>,
     mut handoff: impl FnMut() -> Result<bool>,
     mut show_cad_status_enabled: impl FnMut() -> Result<bool>,
@@ -103,6 +108,10 @@ fn run_with(
     mut show_cad_status: impl FnMut() -> Result<u8>,
 ) -> Result<u8> {
     match cli.command {
+        Command::Install => {
+            install()?;
+            Ok(0)
+        }
         Command::Update => {
             update()?;
             Ok(0)
@@ -319,7 +328,7 @@ fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
 }
 
 // stderrのTTY / NO_COLOR契約に従ってWarningを表示する
-fn print_warning(message: &str) {
+pub(crate) fn print_warning(message: &str) {
     if io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() {
         eprintln!("\x1b[33mWarning:\x1b[0m {message}");
     } else {
@@ -355,6 +364,7 @@ mod tests {
     fn parses_commands() {
         for arguments in [
             vec!["eiyah", "update"],
+            vec!["eiyah", "__install"],
             vec!["eiyah", "config"],
             vec!["eiyah", "doctor"],
             vec!["eiyah", "show-cad-status"],
@@ -370,7 +380,7 @@ mod tests {
     #[test]
     // Planned Branch commandをparserへ含めないことを検証する
     fn rejects_planned_branch_commands() {
-        for command in ["__install", "__uninstall"] {
+        for command in ["__uninstall"] {
             assert!(Cli::try_parse_from(["eiyah", command]).is_err());
         }
     }
@@ -379,6 +389,7 @@ mod tests {
     // internal commandをhelp表示から隠すことを検証する
     fn hides_internal_commands_from_help() {
         let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("__install"));
         assert!(!help.contains("__handoff"));
         assert!(!help.contains("__show-cad-status-enabled"));
     }
@@ -429,6 +440,7 @@ mod tests {
                 run_with(
                     cli,
                     || Ok(()),
+                    || Ok(()),
                     || result.take().unwrap(),
                     || Ok(false),
                     || Ok(false),
@@ -437,6 +449,7 @@ mod tests {
             } else {
                 run_with(
                     cli,
+                    || Ok(()),
                     || Ok(()),
                     || Ok(false),
                     || result.take().unwrap(),
@@ -452,6 +465,7 @@ mod tests {
             assert_eq!(
                 run_with(
                     cli,
+                    || Ok(()),
                     || Ok(()),
                     || Ok(false),
                     || Ok(false),
@@ -475,6 +489,7 @@ mod tests {
             run_with(
                 cli,
                 || Ok(()),
+                || Ok(()),
                 || Ok(false),
                 || Ok(false),
                 || Ok(false),
@@ -493,6 +508,7 @@ mod tests {
             run_with(
                 cli,
                 || Ok(()),
+                || Ok(()),
                 || Ok(false),
                 || Ok(false),
                 || Ok(false),
@@ -505,6 +521,7 @@ mod tests {
         assert!(
             run_with(
                 cli,
+                || Ok(()),
                 || Err(anyhow::anyhow!("update failed")),
                 || Ok(false),
                 || Ok(false),
@@ -513,6 +530,28 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    // __installをinternal implementationへdispatchする
+    fn dispatches_install() -> Result<()> {
+        let cli = Cli::try_parse_from(["eiyah", "__install"])?;
+        let mut called = false;
+        let status = run_with(
+            cli,
+            || {
+                called = true;
+                Ok(())
+            },
+            || Ok(()),
+            || Ok(false),
+            || Ok(false),
+            || Ok(false),
+            || Ok(0),
+        )?;
+        assert_eq!(status, 0);
+        assert!(called);
         Ok(())
     }
 }
