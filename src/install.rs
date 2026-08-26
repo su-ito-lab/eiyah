@@ -8,7 +8,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, Result, bail};
 use semver::Version;
@@ -44,6 +45,22 @@ const GLOBAL_TIMEOUT_SECONDS: u64 = 30;
 const REDIRECT_LIMIT: u32 = 10;
 // SHA-256をlowercase hexで表した文字数
 const SHA256_HEX_LENGTH: usize = 64;
+// GitHub App Device Flowで使用するPublic client ID
+const GITHUB_CLIENT_ID: &str = "Iv23li7y3eZOlLEkxYfP";
+// user access tokenをPrivate repository 1件へ限定するrepository ID
+const PRIVATE_REPOSITORY_ID: &str = "1342986165";
+// Private repositoryのGitHub API path
+const PRIVATE_REPOSITORY: &str = "su-ito-lab/eiyah-core";
+// Device codeを取得するGitHub endpoint
+const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+// Device Flow tokenをpollするGitHub endpoint
+const DEVICE_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+// slow_down応答時に加算するpoll間隔秒数
+const DEVICE_SLOW_DOWN_SECONDS: u64 = 5;
+// Private Releaseから取得するshow-cad-status binary asset名
+const SHOW_CAD_STATUS_ASSET_NAME: &str = "show-cad-status-x86_64-unknown-linux-gnu";
+// Private Releaseから取得するshow-cad-status checksum asset名
+const SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME: &str = "show-cad-status-x86_64-unknown-linux-gnu.sha256";
 
 /// 更新に使用するstable Public Releaseの情報
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +71,78 @@ pub struct ReleaseInfo {
     pub binary_url: String,
     /// checksum assetのdownload URL
     pub checksum_url: String,
+}
+
+/// Private installに使用するsame-tag archiveとRelease assetの情報
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateReleaseInfo {
+    /// latest stable Private Releaseのtag
+    pub tag_name: String,
+    /// same tagをrefに使用するrepository archive URL
+    pub archive_url: String,
+    /// show-cad-status binary assetのGitHub ID
+    pub show_cad_status_asset_id: u64,
+    /// show-cad-status checksum assetのGitHub ID
+    pub show_cad_status_checksum_asset_id: u64,
+}
+
+// GitHub Device code response
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    // token pollingに使用するsecret code
+    device_code: String,
+    // userがGitHubへ入力するcode
+    user_code: String,
+    // userが認証操作を行うURL
+    verification_uri: String,
+    // device codeが失効するまでの秒数
+    expires_in: u64,
+    // GitHubが指定するpoll間隔秒数
+    interval: u64,
+}
+
+// GitHub Device token polling response
+#[derive(Debug, Deserialize)]
+struct DeviceTokenResponse {
+    // 認証成功時のuser access token
+    access_token: Option<String>,
+    // polling継続または失敗理由
+    error: Option<String>,
+    // GitHubが返す具体的なerror説明
+    error_description: Option<String>,
+}
+
+// Device token responseから決定したpoll action
+#[derive(Debug, Eq, PartialEq)]
+enum DevicePollAction {
+    // 認証済みtokenを返す
+    Authorized(String),
+    // 現在の間隔でpollを継続する
+    Pending,
+    // poll間隔を増やして継続する
+    SlowDown,
+}
+
+// Private latest Release responseで使用するfield
+#[derive(Debug, Deserialize)]
+struct PrivateReleaseResponse {
+    // Release tag
+    tag_name: String,
+    // draft Releaseかを示すflag
+    draft: bool,
+    // prereleaseかを示すflag
+    prerelease: bool,
+    // Releaseに添付されたasset
+    assets: Vec<PrivateReleaseAsset>,
+}
+
+// Private required asset選択に使用するGitHub field
+#[derive(Clone, Debug, Deserialize)]
+struct PrivateReleaseAsset {
+    // assetのexact name
+    name: String,
+    // authenticated asset downloadに使用するGitHub ID
+    id: u64,
 }
 
 // GitHub latest Release responseで使用するfield
@@ -149,6 +238,194 @@ pub fn detect_install_state(paths: &ResolvedPaths, public_entry: &Path) -> Resul
     }
 
     Ok(InstallState::Installed)
+}
+
+/// GitHub Device FlowでPrivate repository用user access tokenを取得する
+pub fn authorize_private_repository() -> Result<String> {
+    let agent = http_agent();
+    let mut response = agent
+        .post(DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .send_form([("client_id", GITHUB_CLIENT_ID)])
+        .context("failed to request GitHub device code")?;
+    let issued_at = Instant::now();
+    let device: DeviceCodeResponse = response
+        .body_mut()
+        .read_json()
+        .context("failed to parse GitHub device code response")?;
+    write_device_instructions(&mut io::stdout().lock(), &device)?;
+    poll_device_token(&agent, &device, issued_at)
+}
+
+/// authenticated GitHub APIからlatest stable Private Release情報を取得する
+pub fn fetch_private_release(access_token: &str) -> Result<PrivateReleaseInfo> {
+    let url = format!("https://api.github.com/repos/{PRIVATE_REPOSITORY}/releases/latest");
+    let agent = http_agent();
+    let mut response = private_request(&agent, &url, access_token)
+        .call()
+        .context("failed to fetch latest Private Release")?;
+    let release = parse_private_release_response(response.body_mut())?;
+    private_release_info(release)
+}
+
+// Private Release responseから取得に必要なfieldだけをdecodeする
+fn parse_private_release_response(body: &mut ureq::Body) -> Result<PrivateReleaseResponse> {
+    body.read_json()
+        .context("failed to parse latest Private Release response")
+}
+
+// Device Flowのuser向けinstructionだけをstdoutへ出力する
+fn write_device_instructions(output: &mut impl Write, device: &DeviceCodeResponse) -> Result<()> {
+    writeln!(output, "==> Authorize Eiyah with GitHub")?;
+    writeln!(output, "Open: {}", device.verification_uri)?;
+    writeln!(output, "Code: {}", device.user_code)?;
+    Ok(())
+}
+
+// GitHub指定のintervalとdeadlineを守ってDevice tokenをpollする
+fn poll_device_token(
+    agent: &ureq::Agent,
+    device: &DeviceCodeResponse,
+    issued_at: Instant,
+) -> Result<String> {
+    let deadline = issued_at
+        .checked_add(Duration::from_secs(device.expires_in))
+        .ok_or_else(|| anyhow::anyhow!("GitHub device code expiry is out of range"))?;
+    let mut interval = Duration::from_secs(device.interval);
+
+    loop {
+        ensure_next_poll_before_deadline(Instant::now(), interval, deadline)?;
+        thread::sleep(interval);
+
+        let mut response = agent
+            .post(DEVICE_TOKEN_URL)
+            .header("Accept", "application/json")
+            .send_form([
+                ("client_id", GITHUB_CLIENT_ID),
+                ("device_code", device.device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("repository_id", PRIVATE_REPOSITORY_ID),
+            ])
+            .context("failed to poll GitHub Device Flow token")?;
+        let token: DeviceTokenResponse = response
+            .body_mut()
+            .read_json()
+            .context("failed to parse GitHub Device Flow token response")?;
+        if Instant::now() >= deadline {
+            bail!("GitHub device code expired");
+        }
+        match device_poll_action(token)? {
+            DevicePollAction::Authorized(access_token) => return Ok(access_token),
+            DevicePollAction::Pending => {}
+            DevicePollAction::SlowDown => {
+                interval = increase_device_poll_interval(interval)?;
+            }
+        }
+    }
+}
+
+// slow_down応答に従ってDevice tokenのpoll間隔を増やす
+fn increase_device_poll_interval(interval: Duration) -> Result<Duration> {
+    interval
+        .checked_add(Duration::from_secs(DEVICE_SLOW_DOWN_SECONDS))
+        .ok_or_else(|| anyhow::anyhow!("GitHub Device Flow interval is out of range"))
+}
+
+// 次回pollがDevice codeのdeadlineより前に開始できることを確認する
+fn ensure_next_poll_before_deadline(
+    now: Instant,
+    interval: Duration,
+    deadline: Instant,
+) -> Result<()> {
+    let next_poll = now
+        .checked_add(interval)
+        .ok_or_else(|| anyhow::anyhow!("GitHub Device Flow interval is out of range"))?;
+    if next_poll >= deadline {
+        bail!("GitHub device code expired");
+    }
+    Ok(())
+}
+
+// Device token responseを成功・継続・terminal errorへ分類する
+fn device_poll_action(response: DeviceTokenResponse) -> Result<DevicePollAction> {
+    if let Some(access_token) = response.access_token {
+        if access_token.is_empty() {
+            bail!("GitHub Device Flow returned an empty access token");
+        }
+        return Ok(DevicePollAction::Authorized(access_token));
+    }
+
+    let error = response
+        .error
+        .ok_or_else(|| anyhow::anyhow!("GitHub Device Flow response has no token or error"))?;
+    match error.as_str() {
+        "authorization_pending" => Ok(DevicePollAction::Pending),
+        "slow_down" => Ok(DevicePollAction::SlowDown),
+        "expired_token" => bail!("GitHub device code expired"),
+        "access_denied" => bail!("GitHub authorization was denied"),
+        _ => bail!(
+            "GitHub Device Flow error: {}",
+            response.error_description.as_deref().unwrap_or(&error)
+        ),
+    }
+}
+
+// Private REST APIへ共通headerとBearer tokenを適用する
+fn private_request<'a>(
+    agent: &'a ureq::Agent,
+    url: &'a str,
+    access_token: &str,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    agent
+        .get(url)
+        .header("Accept", GITHUB_ACCEPT)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+}
+
+// stable Releaseとrequired assetからPrivate取得情報を組み立てる
+fn private_release_info(release: PrivateReleaseResponse) -> Result<PrivateReleaseInfo> {
+    if release.draft {
+        bail!("latest Private Release is a draft");
+    }
+    if release.prerelease {
+        bail!("latest Private Release is a prerelease");
+    }
+    if release.tag_name.is_empty() {
+        bail!("latest Private Release tag is empty");
+    }
+    let show_cad_status_asset_id =
+        select_private_release_asset(&release.assets, SHOW_CAD_STATUS_ASSET_NAME)?;
+    let show_cad_status_checksum_asset_id =
+        select_private_release_asset(&release.assets, SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME)?;
+    let archive_url = format!(
+        "https://api.github.com/repos/{PRIVATE_REPOSITORY}/tarball/{}",
+        release.tag_name
+    );
+    Ok(PrivateReleaseInfo {
+        tag_name: release.tag_name,
+        archive_url,
+        show_cad_status_asset_id,
+        show_cad_status_checksum_asset_id,
+    })
+}
+
+// exact nameのPrivate Release asset IDが1件だけ存在することを保証する
+fn select_private_release_asset(
+    assets: &[PrivateReleaseAsset],
+    expected_name: &str,
+) -> Result<u64> {
+    let mut matches = assets
+        .iter()
+        .filter(|asset| asset.name == expected_name)
+        .map(|asset| asset.id);
+    let id = matches.next().ok_or_else(|| {
+        anyhow::anyhow!("required Private Release asset is missing: {expected_name}")
+    })?;
+    if matches.next().is_some() {
+        bail!("required Private Release asset is duplicated: {expected_name}");
+    }
+    Ok(id)
 }
 
 // GitHubのlatest endpointからPublic Release responseを取得する
@@ -588,6 +865,27 @@ mod tests {
         }
     }
 
+    // Private Release test用assetを作成する
+    fn private_release_asset(name: &str, id: u64) -> PrivateReleaseAsset {
+        PrivateReleaseAsset {
+            name: name.to_owned(),
+            id,
+        }
+    }
+
+    // required assetを持つstable Private Release responseを作成する
+    fn stable_private_release() -> PrivateReleaseResponse {
+        PrivateReleaseResponse {
+            tag_name: "v1.2.3".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                private_release_asset(SHOW_CAD_STATUS_ASSET_NAME, 101),
+                private_release_asset(SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME, 102),
+            ],
+        }
+    }
+
     #[test]
     // managed artifactがすべてない場合にNotInstalledとなることを検証する
     fn detects_not_installed_state() -> Result<()> {
@@ -952,5 +1250,136 @@ mod tests {
             |_, _| bail!("binary download must not run"),
             |_| bail!("checksum download must not run"),
         )
+    }
+
+    #[test]
+    // Device code responseとuser向け表示がsecretを含まないことを検証する
+    fn parses_and_displays_device_code_response() -> Result<()> {
+        let mut body = ureq::Body::builder().data(
+            r#"{"device_code":"secret-device","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#,
+        );
+        let device: DeviceCodeResponse = body.read_json()?;
+        let mut output = Vec::new();
+        write_device_instructions(&mut output, &device)?;
+        let output = String::from_utf8(output)?;
+
+        assert_eq!(device.expires_in, 900);
+        assert_eq!(device.interval, 5);
+        assert_eq!(
+            output,
+            "==> Authorize Eiyah with GitHub\nOpen: https://github.com/login/device\nCode: ABCD-1234\n"
+        );
+        assert!(!output.contains(&device.device_code));
+        Ok(())
+    }
+
+    #[test]
+    // Device code deadline到達時には次回pollを開始しないことを検証する
+    fn rejects_poll_at_or_after_device_deadline() -> Result<()> {
+        let now = Instant::now();
+        let interval = Duration::from_secs(5);
+        ensure_next_poll_before_deadline(now, interval, now + Duration::from_secs(6))?;
+        assert!(ensure_next_poll_before_deadline(now, interval, now + interval).is_err());
+        assert!(ensure_next_poll_before_deadline(now, interval, now).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // slow_down時にpoll間隔へ規定の5秒を加算することを検証する
+    fn increases_device_poll_interval_after_slow_down() -> Result<()> {
+        assert_eq!(
+            increase_device_poll_interval(Duration::from_secs(5))?,
+            Duration::from_secs(10)
+        );
+        Ok(())
+    }
+
+    #[test]
+    // Device token responseをsuccess・継続・terminal errorへ分類することを検証する
+    fn classifies_device_token_responses() -> Result<()> {
+        assert_eq!(
+            device_poll_action(DeviceTokenResponse {
+                access_token: Some("token".to_owned()),
+                error: None,
+                error_description: None,
+            })?,
+            DevicePollAction::Authorized("token".to_owned())
+        );
+        for (error, expected) in [
+            ("authorization_pending", DevicePollAction::Pending),
+            ("slow_down", DevicePollAction::SlowDown),
+        ] {
+            assert_eq!(
+                device_poll_action(DeviceTokenResponse {
+                    access_token: None,
+                    error: Some(error.to_owned()),
+                    error_description: None,
+                })?,
+                expected
+            );
+        }
+        for error in ["expired_token", "access_denied", "unexpected"] {
+            assert!(
+                device_poll_action(DeviceTokenResponse {
+                    access_token: None,
+                    error: Some(error.to_owned()),
+                    error_description: Some("detail".to_owned()),
+                })
+                .is_err(),
+                "{error}"
+            );
+        }
+        assert!(
+            device_poll_action(DeviceTokenResponse {
+                access_token: Some(String::new()),
+                error: None,
+                error_description: None,
+            })
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    // stable Private Releaseからsame-tag archiveとrequired asset IDを選択する
+    fn builds_private_release_info() -> Result<()> {
+        let mut body = ureq::Body::builder().data(format!(
+            r#"{{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[{{"name":"{SHOW_CAD_STATUS_ASSET_NAME}","id":101}},{{"name":"{SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME}","id":102}}]}}"#
+        ));
+        let info = private_release_info(parse_private_release_response(&mut body)?)?;
+        assert_eq!(info.tag_name, "v1.2.3");
+        assert_eq!(
+            info.archive_url,
+            "https://api.github.com/repos/su-ito-lab/eiyah-core/tarball/v1.2.3"
+        );
+        assert_eq!(info.show_cad_status_asset_id, 101);
+        assert_eq!(info.show_cad_status_checksum_asset_id, 102);
+        Ok(())
+    }
+
+    #[test]
+    // unstable Private Releaseとmissing・duplicate required assetを拒否する
+    fn rejects_invalid_private_release() {
+        for (draft, prerelease) in [(true, false), (false, true)] {
+            let mut release = stable_private_release();
+            release.draft = draft;
+            release.prerelease = prerelease;
+            assert!(private_release_info(release).is_err());
+        }
+
+        let mut missing = stable_private_release();
+        missing.assets.pop();
+        assert!(private_release_info(missing).is_err());
+
+        let mut duplicate = stable_private_release();
+        duplicate.assets.push(private_release_asset(
+            SHOW_CAD_STATUS_CHECKSUM_ASSET_NAME,
+            103,
+        ));
+        assert!(private_release_info(duplicate).is_err());
+
+        let mut empty_tag = stable_private_release();
+        empty_tag.tag_name.clear();
+        assert!(private_release_info(empty_tag).is_err());
     }
 }
