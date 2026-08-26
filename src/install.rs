@@ -3,12 +3,14 @@
 // @brief Installation state detection and binary update
 // ==================================================
 
+use std::collections::BTreeSet;
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -82,6 +84,14 @@ const PIXI_INSTALLER_URL: &str = "https://pixi.sh/install.sh";
 const BASH_PATH: &str = "/usr/bin/bash";
 // Pixi global manifest fileのpermission
 const PIXI_MANIFEST_MODE: u32 = 0o644;
+// backup directoryをuser以外から隠すpermission
+const BACKUP_DIRECTORY_MODE: u32 = 0o700;
+// generated Git identity fileのpermission
+const GIT_CONFIG_LOCAL_MODE: u32 = 0o600;
+// show-cad-status download中のpermission
+const SHOW_CAD_STATUS_DOWNLOAD_MODE: u32 = 0o600;
+// install済みshow-cad-status binaryのpermission
+const SHOW_CAD_STATUS_EXECUTABLE_MODE: u32 = 0o755;
 // authorized_keys temporary file名の衝突を避けるprocess内連番
 static AUTHORIZED_KEYS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -582,6 +592,560 @@ fn pixi_sync_command(pixi: &Path, pixi_home: &Path, home: &Path) -> Command {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     command
+}
+
+// --------------------------------------------------
+// Private Environment Installation
+// --------------------------------------------------
+
+/// backup成功後にCheckpoint Fが`Moved`へ変換するpath pair
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupMove {
+    /// HOME配下の元path
+    pub from: PathBuf,
+    /// HOME相対layoutを保持したbackup path
+    pub to: PathBuf,
+}
+
+/// 展開済みPrivate rootとdotfiles sourceのfilesystem形状を検証する
+pub fn validate_private_source(core_root: &Path) -> Result<PathBuf> {
+    validate_non_symlink_directory(core_root, "Private root")?;
+    let dotfiles = core_root.join("dotfiles");
+    validate_non_symlink_directory(&dotfiles, "Private dotfiles")?;
+    Ok(dotfiles)
+}
+
+// symlinkを追跡せずexisting directoryであることを保証する
+fn validate_non_symlink_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} is unavailable: {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "{label} must be a non-symlink directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// HOME配下のexisting pathをHOME相対layoutのbackupへatomic no-replaceで移動する
+pub fn backup_home_path(
+    home: &Path,
+    state_home: &Path,
+    source: &Path,
+) -> Result<Option<BackupMove>> {
+    let relative = source
+        .strip_prefix(home)
+        .with_context(|| format!("backup source must be under HOME: {}", source.display()))?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "backup source has an invalid HOME-relative path: {}",
+            source.display()
+        );
+    }
+    if !path_exists(source)? {
+        return Ok(None);
+    }
+
+    let target = state_home.join("eiyah/backup/home").join(relative);
+    let parent = target
+        .parent()
+        .with_context(|| format!("backup target has no parent: {}", target.display()))?;
+    create_backup_directories(state_home, parent)?;
+    rename_without_replace(source, &target).with_context(|| {
+        format!(
+            "failed to backup {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(Some(BackupMove {
+        from: source.to_path_buf(),
+        to: target,
+    }))
+}
+
+// backup parentをmode 0700で作成しexisting directoryのpermissionを維持する
+fn create_backup_directories(state_home: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(state_home).with_context(|| {
+        format!(
+            "backup directory must be under state home: {}",
+            path.display()
+        )
+    })?;
+    let mut directory = state_home.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!("backup directory has an invalid path: {}", path.display());
+        };
+        directory.push(component);
+        let mut builder = DirBuilder::new();
+        builder.mode(BACKUP_DIRECTORY_MODE);
+        match builder.create(&directory) {
+            Ok(()) => fs::set_permissions(
+                &directory,
+                fs::Permissions::from_mode(BACKUP_DIRECTORY_MODE),
+            )?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_non_symlink_directory(&directory, "backup directory")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+// Linuxのrenameat2でbackup targetのatomic no-replaceを保証する
+fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("source path contains a NUL byte"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("destination path contains a NUL byte"))?;
+    // SAFETY: 両pathはNUL終端済みでcall完了まで有効なpointerを保持する
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Private dotfiles treeを新規`$HOME/.dotfiles`へfile typeを保持してcopyする
+pub fn install_dotfiles(core_root: &Path, home: &Path) -> Result<PathBuf> {
+    install_dotfiles_with(core_root, home, |_| Ok(()))
+}
+
+// entry作成直前のraceをtest可能にして所有pathだけをcleanupする
+fn install_dotfiles_with(
+    core_root: &Path,
+    home: &Path,
+    mut before_create: impl FnMut(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    let source = validate_private_source(core_root)?;
+    let target = home.join(".dotfiles");
+    let metadata = create_owned_directory(&target, INSTALL_DIRECTORY_MODE)?;
+    let mut created = vec![(target.clone(), metadata)];
+    let result = copy_directory_contents(&source, &target, &mut created, &mut before_create);
+    if result.is_err() {
+        cleanup_owned_entries(&created);
+    }
+    result.map(|_| target)
+}
+
+// 新規directoryを排他的に作成してidentityを返す
+fn create_owned_directory(path: &Path, mode: u32) -> Result<fs::Metadata> {
+    let mut builder = DirBuilder::new();
+    builder.mode(mode);
+    builder.create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+        let _ = remove_directory_if_same_inode(path, &metadata);
+        return Err(error.into());
+    }
+    Ok(metadata)
+}
+
+// directory treeを既存targetを上書きせずrecursive copyする
+fn copy_directory_contents(
+    source: &Path,
+    target: &Path,
+    created: &mut Vec<(PathBuf, fs::Metadata)>,
+    before_create: &mut impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        before_create(&target_path)?;
+        if metadata.file_type().is_dir() {
+            let mut builder = DirBuilder::new();
+            builder.mode(metadata.permissions().mode() & 0o7777);
+            builder.create(&target_path)?;
+            created.push((target_path.clone(), fs::symlink_metadata(&target_path)?));
+            fs::set_permissions(&target_path, metadata.permissions())?;
+            copy_directory_contents(&source_path, &target_path, created, before_create)?;
+        } else if metadata.file_type().is_file() {
+            let mut source_file = File::open(&source_path)?;
+            let mut target_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(metadata.permissions().mode() & 0o7777)
+                .open(&target_path)?;
+            created.push((target_path.clone(), target_file.metadata()?));
+            io::copy(&mut source_file, &mut target_file)?;
+            target_file.set_permissions(metadata.permissions())?;
+            target_file.sync_all()?;
+        } else if metadata.file_type().is_symlink() {
+            symlink(fs::read_link(&source_path)?, &target_path)?;
+            created.push((target_path.clone(), fs::symlink_metadata(&target_path)?));
+        } else {
+            bail!(
+                "unsupported dotfiles source type: {}",
+                source_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+// 作成時と同じinodeだけを子から親の順でcleanupする
+fn cleanup_owned_entries(created: &[(PathBuf, fs::Metadata)]) {
+    for (path, metadata) in created.iter().rev() {
+        if metadata.file_type().is_dir() {
+            let _ = remove_directory_if_same_inode(path, metadata);
+        } else {
+            let _ = remove_file_if_same_inode(path, metadata);
+        }
+    }
+}
+
+/// global Git identityからrepository外生成対象の`config.local`を作成する
+pub fn create_git_config_local(dotfiles: &Path) -> Result<PathBuf> {
+    create_git_config_local_with(dotfiles, |key| {
+        Command::new("git")
+            .arg("config")
+            .arg("--global")
+            .arg(key)
+            .output()
+            .map_err(Into::into)
+    })
+}
+
+// Git identity取得を差し替え可能にしてconfig.localをsecure作成する
+fn create_git_config_local_with(
+    dotfiles: &Path,
+    mut execute: impl FnMut(&str) -> Result<Output>,
+) -> Result<PathBuf> {
+    let name = git_config_value("user.name", &mut execute)?;
+    let email = git_config_value("user.email", &mut execute)?;
+    let target = dotfiles.join("git/.config/git/config.local");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(GIT_CONFIG_LOCAL_MODE)
+        .open(&target)?;
+    let created = file.metadata()?;
+    let result = (|| -> Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(GIT_CONFIG_LOCAL_MODE))?;
+        write!(file, "[user]\n    name = {name}\n    email = {email}\n")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = remove_file_if_same_inode(&target, &created);
+    }
+    result.map(|_| target)
+}
+
+// Git config stdout末尾のnewlineだけを除去してnon-empty valueを返す
+fn git_config_value(key: &str, execute: &mut impl FnMut(&str) -> Result<Output>) -> Result<String> {
+    let output = execute(key)?;
+    if !output.status.success() {
+        bail!("git config --global {key} failed");
+    }
+    let value = std::str::from_utf8(&output.stdout)?.trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        bail!("git config --global {key} is empty");
+    }
+    Ok(value.to_owned())
+}
+
+/// expected Stow executableを検証してsorted package名を返す
+pub fn stow_packages(paths: &ResolvedPaths, dotfiles: &Path) -> Result<Vec<OsString>> {
+    validate_expected_executable(&paths.pixi_home.join("bin/stow"), "Stow")?;
+    let mut packages = Vec::new();
+    for entry in fs::read_dir(dotfiles)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            packages.push(entry.file_name());
+        }
+    }
+    packages.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    if packages.is_empty() {
+        bail!("dotfiles contains no Stow packages");
+    }
+    Ok(packages)
+}
+
+// expected absolute executableだけを許可する
+fn validate_expected_executable(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{label} path must be absolute: {}", path.display());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        bail!("{label} must be a regular executable: {}", path.display());
+    }
+    Ok(())
+}
+
+/// Stow source treeに対応するHOME conflict targetを重複なしで返す
+pub fn stow_conflicts(dotfiles: &Path, home: &Path, packages: &[OsString]) -> Result<Vec<PathBuf>> {
+    let mut conflicts = BTreeSet::new();
+    for package in packages {
+        collect_stow_conflicts(
+            &dotfiles.join(package),
+            home,
+            dotfiles,
+            home,
+            &mut conflicts,
+        )?;
+    }
+    Ok(conflicts.into_iter().collect())
+}
+
+// source entryをHOME targetへ写像してbackup対象を収集する
+fn collect_stow_conflicts(
+    source: &Path,
+    target: &Path,
+    dotfiles: &Path,
+    home: &Path,
+    conflicts: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if !target_path.starts_with(home) {
+            bail!("Stow target escapes HOME: {}", target_path.display());
+        }
+        let source_metadata = fs::symlink_metadata(&source_path)?;
+        let target_metadata = fs::symlink_metadata(&target_path);
+        if source_metadata.file_type().is_dir() {
+            match target_metadata {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    collect_stow_conflicts(&source_path, &target_path, dotfiles, home, conflicts)?
+                }
+                Ok(_) => {
+                    conflicts.insert(target_path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else if source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink()
+        {
+            match target_metadata {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        && is_correct_stow_symlink(&target_path, &source_path)? => {}
+                Ok(_) => {
+                    conflicts.insert(target_path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            bail!("unsupported Stow source type: {}", source_path.display());
+        }
+    }
+    let _ = dotfiles;
+    Ok(())
+}
+
+// symlink targetをparent基準でlexical解決して対応sourceと比較する
+fn is_correct_stow_symlink(target: &Path, source: &Path) -> Result<bool> {
+    let link = fs::read_link(target)?;
+    let resolved = if link.is_absolute() {
+        lexical_normalize(&link)
+    } else {
+        lexical_normalize(&target.parent().unwrap_or(Path::new("/")).join(link))
+    };
+    Ok(resolved == lexical_normalize(source))
+}
+
+// filesystem accessなしで`.`と`..`を処理する
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// sorted packageをexpected Stow binaryで一括配置する
+pub fn run_stow(paths: &ResolvedPaths, home: &Path, packages: &[OsString]) -> Result<()> {
+    run_stow_with(paths, home, packages, |command| {
+        command.status().map_err(Into::into)
+    })
+}
+
+// Stow実行を差し替え可能にしてargv・cwd contractを構成する
+fn run_stow_with(
+    paths: &ResolvedPaths,
+    home: &Path,
+    packages: &[OsString],
+    mut execute: impl FnMut(&mut Command) -> Result<ExitStatus>,
+) -> Result<()> {
+    let executable = paths.pixi_home.join("bin/stow");
+    validate_expected_executable(&executable, "Stow")?;
+    let dotfiles = home.join(".dotfiles");
+    let mut command = Command::new(executable);
+    command
+        .arg("--target")
+        .arg(home)
+        .arg("--dir")
+        .arg(&dotfiles)
+        .args(packages)
+        .current_dir(&dotfiles)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = execute(&mut command)?;
+    if !status.success() {
+        bail!("Stow failed: {status}");
+    }
+    Ok(())
+}
+
+/// authenticated Private Release assetからshow-cad-status binaryを配置する
+pub fn install_show_cad_status(
+    paths: &ResolvedPaths,
+    access_token: &str,
+    binary_asset_id: u64,
+    checksum_asset_id: u64,
+) -> Result<PathBuf> {
+    install_show_cad_status_with(
+        paths,
+        binary_asset_id,
+        checksum_asset_id,
+        |id, target| download_private_asset_to(access_token, id, target),
+        |id| download_private_asset(access_token, id),
+    )
+}
+
+// asset取得を差し替え可能にしてchecksum検証後のbinaryを作成する
+fn install_show_cad_status_with(
+    paths: &ResolvedPaths,
+    binary_asset_id: u64,
+    checksum_asset_id: u64,
+    mut download_binary: impl FnMut(u64, &mut File) -> Result<()>,
+    mut download_checksum: impl FnMut(u64) -> Result<Vec<u8>>,
+) -> Result<PathBuf> {
+    let target = paths.eiyah_prefix.join("bin/show-cad-status");
+    let checksum = parse_show_cad_status_checksum(&download_checksum(checksum_asset_id)?)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SHOW_CAD_STATUS_DOWNLOAD_MODE)
+        .open(&target)?;
+    let created = file.metadata()?;
+    let result = (|| -> Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(SHOW_CAD_STATUS_DOWNLOAD_MODE))?;
+        download_binary(binary_asset_id, &mut file)?;
+        file.sync_all()?;
+        verify_checksum(&target, &checksum).context("show-cad-status checksum does not match")?;
+        file.set_permissions(fs::Permissions::from_mode(SHOW_CAD_STATUS_EXECUTABLE_MODE))?;
+        file.sync_all()?;
+        if file.metadata()?.permissions().mode() & 0o111 == 0 {
+            bail!("show-cad-status binary is not executable");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = remove_file_if_same_inode(&target, &created);
+    }
+    result.map(|_| target)
+}
+
+// authenticated GitHub asset endpointをoctet-streamとして取得する
+fn download_private_asset(access_token: &str, asset_id: u64) -> Result<Vec<u8>> {
+    let mut content = Vec::new();
+    download_private_asset_to(access_token, asset_id, &mut content)?;
+    Ok(content)
+}
+
+// authenticated GitHub assetを指定writerへstreamする
+fn download_private_asset_to(
+    access_token: &str,
+    asset_id: u64,
+    target: &mut impl Write,
+) -> Result<()> {
+    let url = private_asset_url(asset_id);
+    let agent = http_agent();
+    let mut response = agent
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .call()?;
+    io::copy(&mut response.body_mut().as_reader(), target)?;
+    Ok(())
+}
+
+// asset IDからPrivate Release download endpointを構成する
+fn private_asset_url(asset_id: u64) -> String {
+    format!("https://api.github.com/repos/{PRIVATE_REPOSITORY}/releases/assets/{asset_id}")
+}
+
+// show-cad-status checksum assetのexact formatをdecodeする
+fn parse_show_cad_status_checksum(content: &[u8]) -> Result<[u8; 32]> {
+    let text = std::str::from_utf8(content)?;
+    let suffix = format!("  {SHOW_CAD_STATUS_ASSET_NAME}\n");
+    if text.len() != SHA256_HEX_LENGTH + suffix.len() || !text.ends_with(&suffix) {
+        bail!("invalid show-cad-status checksum format");
+    }
+    let hexadecimal = &text[..SHA256_HEX_LENGTH];
+    if !hexadecimal
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("show-cad-status checksum must be lowercase hexadecimal");
+    }
+    let mut checksum = [0_u8; 32];
+    for (index, byte) in checksum.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hexadecimal[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(checksum)
+}
+
+/// show-cad-status binaryへのabsolute public symlinkを作成する
+pub fn create_show_cad_status_entry(paths: &ResolvedPaths, home: &Path) -> Result<PathBuf> {
+    let target = paths.eiyah_prefix.join("bin/show-cad-status");
+    if !target.is_absolute() {
+        bail!("show-cad-status entry target must be absolute");
+    }
+    let entry = home.join(".local/bin/show-cad-status");
+    symlink(&target, &entry)?;
+    Ok(entry)
+}
+
+/// Stow後の`.cshrc`がdotfiles sourceを指すsymlinkであることを検証する
+pub fn validate_stowed_cshrc(dotfiles: &Path, home: &Path) -> Result<()> {
+    let source = dotfiles.join("tcsh/.cshrc");
+    let target = home.join(".cshrc");
+    if !fs::symlink_metadata(&target)?.file_type().is_symlink()
+        || !is_correct_stow_symlink(&target, &source)?
+    {
+        bail!(".cshrc is not linked to the installed dotfiles source");
+    }
+    Ok(())
 }
 
 // GitHub Device code response
@@ -2962,6 +3526,317 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(&raced_manifest)?, b"concurrent manifest");
+        Ok(())
+    }
+
+    #[test]
+    // Private sourceを検証してdotfilesのmode・content・symlinkを保持してcopyする
+    fn installs_private_dotfiles_tree() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let core = directory.path.join("core");
+        let source = core.join("dotfiles/git");
+        fs::create_dir_all(&source)?;
+        let source_file = source.join("config");
+        fs::write(&source_file, b"git config")?;
+        fs::set_permissions(&source_file, fs::Permissions::from_mode(0o640))?;
+        symlink("config", source.join("config-link"))?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+
+        let target = install_dotfiles(&core, &home)?;
+
+        assert_eq!(target, home.join(".dotfiles"));
+        assert_eq!(fs::read(target.join("git/config"))?, b"git config");
+        assert_eq!(
+            fs::metadata(target.join("git/config"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_link(target.join("git/config-link"))?,
+            Path::new("config")
+        );
+        assert_eq!(fs::read(&source_file)?, b"git config");
+        Ok(())
+    }
+
+    #[test]
+    // copy中に他者所有entryが出現してもそのentryをcleanupしない
+    fn preserves_dotfiles_entry_created_during_copy_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let core = directory.path.join("core");
+        fs::create_dir_all(core.join("dotfiles/git"))?;
+        fs::write(core.join("dotfiles/git/config"), b"source")?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+        let raced_target = home.join(".dotfiles/git/config");
+
+        assert!(
+            install_dotfiles_with(&core, &home, |target| {
+                if target == raced_target {
+                    fs::write(target, b"concurrent")?;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&raced_target)?, b"concurrent");
+        Ok(())
+    }
+
+    #[test]
+    // HOME pathをrelative layoutのbackupへ移動しcollision時はsourceを維持する
+    fn backs_up_home_paths_without_replacement() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let state = directory.path.join("state");
+        fs::create_dir(&home)?;
+        fs::create_dir(&state)?;
+        let source = home.join(".cshrc");
+        fs::write(&source, b"original")?;
+
+        let moved = backup_home_path(&home, &state, &source)?.unwrap();
+        assert_eq!(moved.from, source);
+        assert_eq!(moved.to, state.join("eiyah/backup/home/.cshrc"));
+        assert_eq!(fs::read(&moved.to)?, b"original");
+
+        fs::write(&source, b"second")?;
+        assert!(backup_home_path(&home, &state, &source).is_err());
+        assert_eq!(fs::read(&source)?, b"second");
+        assert_eq!(fs::read(&moved.to)?, b"original");
+        assert!(backup_home_path(&home, &state, &directory.path.join("outside")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // existing backup ancestorがsymlinkの場合はbackup前に拒否する
+    fn rejects_symlink_backup_ancestor() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let state = directory.path.join("state");
+        let redirected = directory.path.join("redirected");
+        fs::create_dir(&home)?;
+        fs::create_dir(&state)?;
+        fs::create_dir_all(redirected.join("backup/home"))?;
+        symlink(&redirected, state.join("eiyah"))?;
+        let source = home.join(".cshrc");
+        fs::write(&source, b"original")?;
+
+        assert!(backup_home_path(&home, &state, &source).is_err());
+        assert_eq!(fs::read(&source)?, b"original");
+        assert!(!redirected.join("backup/home/.cshrc").exists());
+        Ok(())
+    }
+
+    #[test]
+    // Git identityからmode 0600のconfig.localを生成しmissing identityを拒否する
+    fn creates_generated_git_config_local() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let dotfiles = directory.path.join("dotfiles");
+        fs::create_dir_all(dotfiles.join("git/.config/git"))?;
+        let target = create_git_config_local_with(&dotfiles, |key| {
+            let value = match key {
+                "user.name" => b"Example User\n".as_slice(),
+                "user.email" => b"user@example.com\n".as_slice(),
+                _ => unreachable!(),
+            };
+            Ok(ssh_keygen_output(0, value, b""))
+        })?;
+        assert_eq!(
+            fs::read_to_string(&target)?,
+            "[user]\n    name = Example User\n    email = user@example.com\n"
+        );
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o600);
+
+        fs::remove_file(&target)?;
+        assert!(
+            create_git_config_local_with(&dotfiles, |_| Ok(ssh_keygen_output(0, b"\n", b"")))
+                .is_err()
+        );
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    // Stow packageをbyte順に列挙しexpected executable以外を許可しない
+    fn enumerates_stow_packages_in_stable_order() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"stow")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+        let dotfiles = directory.path.join("dotfiles");
+        fs::create_dir(&dotfiles)?;
+        fs::create_dir(dotfiles.join("zsh"))?;
+        fs::create_dir(dotfiles.join("git"))?;
+        fs::write(dotfiles.join("README"), b"ignored")?;
+        symlink("git", dotfiles.join("linked-package"))?;
+
+        assert_eq!(
+            stow_packages(&paths, &dotfiles)?,
+            vec![OsString::from("git"), OsString::from("zsh")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    // correct symlinkを維持し通常targetと.cshrc conflictをgenericに収集する
+    fn detects_stow_conflicts_and_correct_links() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let dotfiles = home.join(".dotfiles");
+        fs::create_dir_all(dotfiles.join("git/.config/git"))?;
+        fs::create_dir_all(dotfiles.join("tcsh"))?;
+        fs::write(dotfiles.join("git/.config/git/config"), b"source")?;
+        fs::write(dotfiles.join("tcsh/.cshrc"), b"source")?;
+        fs::create_dir_all(home.join(".config/git"))?;
+        symlink(
+            "../../.dotfiles/git/.config/git/config",
+            home.join(".config/git/config"),
+        )?;
+        fs::write(home.join(".cshrc"), b"existing")?;
+
+        let conflicts = stow_conflicts(
+            &dotfiles,
+            &home,
+            &[OsString::from("git"), OsString::from("tcsh")],
+        )?;
+        assert_eq!(conflicts, vec![home.join(".cshrc")]);
+        let state = directory.path.join("state");
+        fs::create_dir(&state)?;
+        let moved = backup_home_path(&home, &state, &conflicts[0])?.unwrap();
+        assert_eq!(moved.to, state.join("eiyah/backup/home/.cshrc"));
+        symlink(".dotfiles/tcsh/.cshrc", home.join(".cshrc"))?;
+        validate_stowed_cshrc(&dotfiles, &home)?;
+        assert!(is_correct_stow_symlink(
+            &home.join(".config/git/config"),
+            &dotfiles.join("git/.config/git/config")
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    // Stowをcanonical argv・cwdで実行しnon-zeroをerrorにする
+    fn runs_stow_with_canonical_command() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"stow")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+        let home = directory.path.join("home");
+        fs::create_dir_all(home.join(".dotfiles"))?;
+        let packages = vec![OsString::from("git"), OsString::from("tcsh")];
+
+        run_stow_with(&paths, &home, &packages, |command| {
+            assert_eq!(command.get_program(), stow);
+            assert_eq!(
+                command.get_current_dir(),
+                Some(home.join(".dotfiles").as_path())
+            );
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    OsStr::new("--target"),
+                    home.as_os_str(),
+                    OsStr::new("--dir"),
+                    home.join(".dotfiles").as_os_str(),
+                    OsStr::new("git"),
+                    OsStr::new("tcsh")
+                ]
+            );
+            Ok(std::process::ExitStatus::from_raw(0))
+        })?;
+        assert!(
+            run_stow_with(&paths, &home, &packages, |_| {
+                Ok(std::process::ExitStatus::from_raw(1 << 8))
+            })
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    // show-cad-status asset ID・checksum・mode・public symlink contractを検証する
+    fn installs_show_cad_status_and_public_entry() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(paths.eiyah_prefix.join("bin"))?;
+        let binary = b"show-cad-status binary";
+        let digest = Sha256::digest(binary);
+        let checksum = format!("{digest:x}  {SHOW_CAD_STATUS_ASSET_NAME}\n").into_bytes();
+
+        let target = install_show_cad_status_with(
+            &paths,
+            101,
+            102,
+            |id, file| {
+                assert_eq!(id, 101);
+                file.write_all(binary)?;
+                Ok(())
+            },
+            |id| {
+                assert_eq!(id, 102);
+                Ok(checksum.clone())
+            },
+        )?;
+        assert_eq!(fs::read(&target)?, binary);
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            private_asset_url(101),
+            "https://api.github.com/repos/su-ito-lab/eiyah-core/releases/assets/101"
+        );
+
+        let home = directory.path.join("home");
+        fs::create_dir_all(home.join(".local/bin"))?;
+        let entry = create_show_cad_status_entry(&paths, &home)?;
+        assert_eq!(fs::read_link(&entry)?, target);
+        assert!(create_show_cad_status_entry(&paths, &home).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // show-cad-status checksum mismatchとdownload failureでpartial targetをcleanupする
+    fn cleans_failed_show_cad_status_installation() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        fs::create_dir_all(paths.eiyah_prefix.join("bin"))?;
+        let digest = Sha256::digest(b"different");
+        let checksum = format!("{digest:x}  {SHOW_CAD_STATUS_ASSET_NAME}\n").into_bytes();
+
+        assert!(
+            install_show_cad_status_with(
+                &paths,
+                1,
+                2,
+                |_, file| {
+                    file.write_all(b"binary")?;
+                    Ok(())
+                },
+                |_| Ok(checksum.clone()),
+            )
+            .is_err()
+        );
+        assert!(!paths.eiyah_prefix.join("bin/show-cad-status").exists());
+
+        assert!(
+            install_show_cad_status_with(
+                &paths,
+                1,
+                2,
+                |_, file| {
+                    file.write_all(b"partial")?;
+                    Err(anyhow::anyhow!("injected download failure"))
+                },
+                |_| Ok(checksum.clone()),
+            )
+            .is_err()
+        );
+        assert!(!paths.eiyah_prefix.join("bin/show-cad-status").exists());
+        assert!(parse_show_cad_status_checksum(b"invalid\n").is_err());
         Ok(())
     }
 }

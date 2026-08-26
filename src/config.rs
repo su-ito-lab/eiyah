@@ -319,6 +319,31 @@ where
     let contents =
         toml::to_string(&metadata).context("failed to serialize installation metadata")?;
     let target = paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME);
+    create_initial_file_with(&target, contents.as_bytes(), before_commit)
+}
+
+/// 初回install用configを`show-cad-status = true`で新規作成する
+pub fn create_initial_config(paths: &ResolvedPaths) -> Result<()> {
+    create_initial_config_with(paths, |_| Ok(()))
+}
+
+// commit直前のraceをtest可能にしてinitial configを作成する
+fn create_initial_config_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let contents = toml::to_string(&Config {
+        show_cad_status: true,
+    })
+    .context("failed to serialize initial config")?;
+    create_initial_file_with(&paths.eiyah_config, contents.as_bytes(), before_commit)
+}
+
+// same-directory temporary fileからinitial targetをatomic no-replaceで作成する
+fn create_initial_file_with<F>(target: &Path, contents: &[u8], before_commit: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     validate_initial_target(&target)?;
 
     let parent = target
@@ -346,14 +371,12 @@ where
                     temporary_path.display()
                 )
             })?;
-        temporary_file
-            .write_all(contents.as_bytes())
-            .with_context(|| {
-                format!(
-                    "failed to write temporary file: {}",
-                    temporary_path.display()
-                )
-            })?;
+        temporary_file.write_all(contents).with_context(|| {
+            format!(
+                "failed to write temporary file: {}",
+                temporary_path.display()
+            )
+        })?;
         temporary_file.sync_all().with_context(|| {
             format!(
                 "failed to sync temporary file: {}",
@@ -1305,6 +1328,47 @@ mod tests {
         let replacement = replacement.unwrap();
         assert_eq!(fs::read(&replacement)?, b"concurrent temporary");
         assert!(!paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    // initial configを明示的なtrueとmode 0600でatomic no-replace作成する
+    fn creates_initial_config_without_replacement() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+
+        create_initial_config(&paths)?;
+
+        assert_eq!(
+            load_config(&paths.eiyah_config)?,
+            Config {
+                show_cad_status: true
+            }
+        );
+        assert_eq!(
+            fs::metadata(&paths.eiyah_config)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(create_initial_config(&paths).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // config commit raceでexisting targetを上書きせずtemporaryだけをcleanupする
+    fn preserves_initial_config_created_during_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+
+        assert!(
+            create_initial_config_with(&paths, |_| {
+                fs::write(&paths.eiyah_config, b"concurrent config")?;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&paths.eiyah_config)?, b"concurrent config");
         Ok(())
     }
 }
