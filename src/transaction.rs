@@ -368,6 +368,15 @@ pub(crate) fn append_backup_index_entry(path: &Path, entry: &[u8]) -> Result<()>
 
 // backup index全体をsame-directory temporary fileからatomic置換する
 pub(crate) fn write_backup_index(path: &Path, entries: &[Vec<u8>]) -> Result<()> {
+    write_backup_index_with(path, entries, |_| Ok(()))
+}
+
+// rename直前のtemporary replacement raceをtest可能にしてindexを保存する
+fn write_backup_index_with(
+    path: &Path,
+    entries: &[Vec<u8>],
+    before_rename: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("backup index has no parent"))?;
@@ -392,7 +401,11 @@ pub(crate) fn write_backup_index(path: &Path, entries: &[Vec<u8>]) -> Result<()>
             file.write_all(b"\n")?;
         }
         file.sync_all()?;
-        drop(file);
+        before_rename(&temporary)?;
+        let current = fs::symlink_metadata(&temporary)?;
+        if current.dev() != created.dev() || current.ino() != created.ino() {
+            bail!("backup index temporary file was replaced");
+        }
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -631,6 +644,30 @@ mod tests {
         assert!(decode_backup_index_entry(b"ABCDEF").is_err());
         assert!(decode_backup_index_entry(b"0").is_err());
         assert!(decode_backup_index_entry(b"7a00").is_err());
+        Ok(())
+    }
+
+    #[test]
+    // commit前に置換された他者所有temporary fileをrenameもcleanupもしない
+    fn preserves_replaced_backup_index_temporary_file() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let index = directory.path.join("index");
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        let mut replacement = None;
+
+        assert!(
+            write_backup_index_with(&index, &[entry], |temporary| {
+                fs::remove_file(temporary)?;
+                fs::write(temporary, b"concurrent temporary")?;
+                replacement = Some(temporary.to_path_buf());
+                Ok(())
+            })
+            .is_err()
+        );
+
+        let replacement = replacement.unwrap();
+        assert_eq!(fs::read(&replacement)?, b"concurrent temporary");
+        assert!(!index.exists());
         Ok(())
     }
 
