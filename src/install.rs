@@ -1582,6 +1582,140 @@ fn cleanup_backup_directory(directory: &Path) -> Result<bool> {
     }
 }
 
+// --------------------------------------------------
+// Uninstall Orchestration
+// --------------------------------------------------
+
+/// install metadata由来pathだけを使用してmanaged environmentを削除する
+pub fn run_uninstall() -> Result<()> {
+    let home = runtime_home()?;
+    run_uninstall_from_home(&home)
+}
+
+// HOMEを差し替え可能にしてmetadata復元からlock・uninstallまで実行する
+fn run_uninstall_from_home(home: &Path) -> Result<()> {
+    let paths = load_uninstall_paths(home)?;
+    let _lock = LockGuard::acquire(&paths.state_home)?;
+    uninstall_locked(&paths, home)
+}
+
+// public entryからinstalled metadataを読みuninstall対象pathを復元する
+fn load_uninstall_paths(home: &Path) -> Result<ResolvedPaths> {
+    let metadata_path = discover_install_metadata(&home.join(".local/bin/eiyah"))?;
+    let metadata = load_install_metadata(&metadata_path)?;
+    ResolvedPaths::from_install_metadata(metadata)
+}
+
+// lock取得後のuninstall処理を仕様順に実行する
+fn uninstall_locked(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    uninstall_preflight(paths, home)?;
+    unstow_managed_packages(paths, home)?;
+    remove_show_cad_status_entry(paths, home)?;
+    remove_managed_content(paths, home)?;
+    restore_home_backups(paths, home)?;
+    validate_uninstallation(paths, home)?;
+    cleanup_uninstall_cache(paths)
+}
+
+/// filesystemを変更せずuninstall開始条件を検証する
+pub fn uninstall_preflight(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        bail!("HOME must be an absolute non-empty path");
+    }
+    for (name, path) in [
+        ("config home", &paths.config_home),
+        ("data home", &paths.data_home),
+        ("state home", &paths.state_home),
+        ("cache home", &paths.cache_home),
+        ("Eiyah prefix", &paths.eiyah_prefix),
+        ("Eiyah config", &paths.eiyah_config),
+        ("Pixi home", &paths.pixi_home),
+    ] {
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            bail!(
+                "{name} must be an absolute non-empty path: {}",
+                path.display()
+            );
+        }
+    }
+
+    validate_non_symlink_directory(&home.join(".dotfiles"), "dotfiles")?;
+    validate_non_symlink_directory(&paths.pixi_home, "Pixi home")?;
+    validate_expected_executable(&paths.pixi_home.join("bin/stow"), "Stow")?;
+    validate_optional_directory(&paths.state_home.join("eiyah/backup"), "backup directory")?;
+    validate_optional_uninstall_file(&paths.state_home.join("eiyah/backup/index"), "backup index")
+}
+
+/// managed content削除とbackup復元の完了状態を変更せず検証する
+pub fn validate_uninstallation(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    for path in [
+        home.join(".local/bin/show-cad-status"),
+        paths.eiyah_prefix.join("bin/show-cad-status"),
+        paths.eiyah_config.clone(),
+        home.join(".dotfiles"),
+        paths.pixi_home.clone(),
+        paths.eiyah_prefix.join("install.toml"),
+        paths.state_home.join("eiyah/backup/index"),
+    ] {
+        if path_exists(&path)? {
+            bail!("uninstall target still exists: {}", path.display());
+        }
+    }
+
+    validate_expected_executable(&paths.eiyah_prefix.join("bin/eiyah"), "Eiyah")?;
+    validate_absolute_entry(
+        &home.join(".local/bin/eiyah"),
+        &paths.eiyah_prefix.join("bin/eiyah"),
+    )?;
+    validate_non_symlink_directory(&paths.state_home.join("eiyah"), "state root")?;
+    validate_regular_non_symlink(&paths.state_home.join("eiyah/lock"), "operation lock")?;
+
+    let backup_root = paths.state_home.join("eiyah/backup/home");
+    match fs::symlink_metadata(&backup_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                bail!(
+                    "backup root must be a non-symlink directory: {}",
+                    backup_root.display()
+                );
+            }
+            if fs::read_dir(&backup_root)?.next().transpose()?.is_some() {
+                bail!("backup root must be empty: {}", backup_root.display());
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+// optional pathがdirectory / non-symlinkであることを検証する
+fn validate_optional_directory(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => bail!(
+            "{label} must be a non-symlink directory: {}",
+            path.display()
+        ),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// optional pathがregular / non-symlinkであることを検証する
+fn validate_optional_uninstall_file(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => bail!("{label} must be a regular file: {}", path.display()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// authenticated Private Release assetからshow-cad-status binaryを配置する
 pub fn install_show_cad_status(
     paths: &ResolvedPaths,
@@ -3279,6 +3413,33 @@ mod tests {
         fs::create_dir_all(public_entry.parent().unwrap())?;
         symlink(&binary, public_entry)?;
         save_install_metadata(paths)
+    }
+
+    // Checkpoint Cのuninstall全体を実行できるmanaged fixtureを作成する
+    fn create_uninstall_fixture(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+        let public_entry = home.join(".local/bin/eiyah");
+        create_installed_fixture(paths, &public_entry)?;
+
+        let status_binary = paths.eiyah_prefix.join("bin/show-cad-status");
+        fs::write(&status_binary, b"status")?;
+        fs::set_permissions(&status_binary, fs::Permissions::from_mode(0o755))?;
+        symlink(&status_binary, home.join(".local/bin/show-cad-status"))?;
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+        fs::write(&paths.eiyah_config, b"show-cad-status = true\n")?;
+        fs::create_dir_all(home.join(".dotfiles/tcsh"))?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+
+        let relative = Path::new(".cshrc");
+        let (backup_root, _) = create_backup_fixture(paths, &[relative])?;
+        fs::write(backup_root.join(relative), b"restored")?;
+        fs::create_dir_all(paths.cache_home.join("eiyah/downloads"))?;
+        fs::write(paths.cache_home.join("eiyah/downloads/archive"), b"cache")?;
+        fs::create_dir_all(paths.state_home.join("eiyah"))?;
+        fs::write(paths.state_home.join("eiyah/lock"), b"")?;
+        Ok(())
     }
 
     // update test用のRelease assetを作成する
@@ -5877,6 +6038,77 @@ mod tests {
         assert_eq!(fs::read(home.join(relative))?, b"backup");
         assert_eq!(fs::read(&index)?, b"other owner");
         assert!(original_index.is_file());
+        Ok(())
+    }
+
+    #[test]
+    // public entryのmetadataを正本としてuninstall pathを復元する
+    fn loads_uninstall_paths_from_installed_metadata() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path.join("installed"))?;
+        let home = directory.path.join("home");
+        create_installed_fixture(&paths, &home.join(".local/bin/eiyah"))?;
+
+        assert_eq!(load_uninstall_paths(&home)?, paths);
+        Ok(())
+    }
+
+    #[test]
+    // uninstall preflightがrequired path形状だけを変更せず検証する
+    fn validates_uninstall_preflight_without_modification() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        fs::create_dir_all(home.join(".dotfiles/tcsh"))?;
+        let stow = paths.pixi_home.join("bin/stow");
+        fs::create_dir_all(stow.parent().unwrap())?;
+        fs::write(&stow, b"stow")?;
+        fs::set_permissions(&stow, fs::Permissions::from_mode(0o755))?;
+
+        uninstall_preflight(&paths, &home)?;
+        assert!(home.join(".dotfiles").is_dir());
+        assert!(paths.pixi_home.is_dir());
+
+        let backup = paths.state_home.join("eiyah/backup");
+        fs::create_dir_all(backup.parent().unwrap())?;
+        symlink(directory.path.join("elsewhere"), &backup)?;
+        assert!(uninstall_preflight(&paths, &home).is_err());
+        assert!(fs::symlink_metadata(&backup)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    // Checkpoint A/B helperを順序通り接続してstate・lockを保持する
+    fn uninstalls_managed_environment_and_preserves_final_cleanup_targets() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        create_uninstall_fixture(&paths, &home)?;
+
+        run_uninstall_from_home(&home)?;
+
+        assert_eq!(fs::read(home.join(".cshrc"))?, b"restored");
+        assert!(paths.eiyah_prefix.join("bin/eiyah").is_file());
+        assert!(home.join(".local/bin/eiyah").is_symlink());
+        assert!(paths.state_home.join("eiyah").is_dir());
+        assert!(paths.state_home.join("eiyah/lock").is_file());
+        assert!(!paths.cache_home.join("eiyah").exists());
+        Ok(())
+    }
+
+    #[test]
+    // validation failureではcache cleanupへ進まず最終cleanup対象を保持する
+    fn preserves_cache_when_uninstall_validation_fails() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        create_uninstall_fixture(&paths, &home)?;
+        fs::remove_file(paths.eiyah_prefix.join("bin/eiyah"))?;
+
+        assert!(uninstall_locked(&paths, &home).is_err());
+        assert!(paths.cache_home.join("eiyah/downloads/archive").is_file());
+        assert_eq!(fs::read(home.join(".cshrc"))?, b"restored");
+        assert!(paths.state_home.join("eiyah/lock").is_file());
         Ok(())
     }
 

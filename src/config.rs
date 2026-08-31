@@ -383,8 +383,6 @@ where
                 temporary_path.display()
             )
         })?;
-        drop(temporary_file);
-
         validate_initial_target(&target)?;
         before_commit(&temporary_path)?;
         validate_same_inode(&temporary_path, &created_temporary)?;
@@ -488,6 +486,13 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("target has no file name: {}", target.display()))?;
     // renameのatomicityを保つため、targetと同一filesystem上へ作成する
     let (temporary_path, mut temporary_file) = create_temporary_file(parent, file_name)?;
+    // replacement検知とcleanupを今回create_newしたinodeへ限定するidentity
+    let created_temporary = temporary_file.metadata().with_context(|| {
+        format!(
+            "failed to inspect temporary file: {}",
+            temporary_path.display()
+        )
+    })?;
 
     // 途中失敗時のtemporary file cleanupを共通化するため結果を保持する
     let result = (|| -> Result<()> {
@@ -511,9 +516,8 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
                 temporary_path.display()
             )
         })?;
-        drop(temporary_file);
-
         validate_replace_target(target)?;
+        validate_same_inode(&temporary_path, &created_temporary)?;
         fs::rename(&temporary_path, target).with_context(|| {
             format!(
                 "failed to replace {} with {}",
@@ -525,7 +529,7 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = remove_file_if_same_inode(&temporary_path, &created_temporary);
     }
     result
 }

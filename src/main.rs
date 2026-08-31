@@ -27,7 +27,7 @@ use config::{
     runtime_home, set_show_cad_status,
 };
 use handoff::{run_handoff, run_show_cad_status_enabled};
-use install::{run_install, run_update};
+use install::{run_install, run_uninstall, run_update};
 
 // 実装済みのPublic / Internal CLI
 #[derive(Debug, Parser)]
@@ -44,6 +44,9 @@ enum Command {
     // bootstrap binaryからinitial installを実行するinternal command
     #[command(name = "__install", hide = true)]
     Install,
+    // managed environmentを削除するinternal command
+    #[command(name = "__uninstall", hide = true)]
+    Uninstall,
     // Public ReleaseからEiyah binaryを更新する
     Update,
     // Eiyahとsystem configurationを表示する
@@ -89,6 +92,7 @@ fn run(cli: Cli) -> Result<u8> {
     run_with(
         cli,
         run_install,
+        run_uninstall,
         run_update,
         run_handoff,
         run_show_cad_status_enabled,
@@ -101,6 +105,7 @@ fn run(cli: Cli) -> Result<u8> {
 fn run_with(
     cli: Cli,
     mut install: impl FnMut() -> Result<()>,
+    mut uninstall: impl FnMut() -> Result<()>,
     mut update: impl FnMut() -> Result<()>,
     mut handoff: impl FnMut() -> Result<bool>,
     mut show_cad_status_enabled: impl FnMut() -> Result<bool>,
@@ -110,6 +115,10 @@ fn run_with(
     match cli.command {
         Command::Install => {
             install()?;
+            Ok(0)
+        }
+        Command::Uninstall => {
+            uninstall()?;
             Ok(0)
         }
         Command::Update => {
@@ -365,6 +374,7 @@ mod tests {
         for arguments in [
             vec!["eiyah", "update"],
             vec!["eiyah", "__install"],
+            vec!["eiyah", "__uninstall"],
             vec!["eiyah", "config"],
             vec!["eiyah", "doctor"],
             vec!["eiyah", "show-cad-status"],
@@ -378,18 +388,11 @@ mod tests {
     }
 
     #[test]
-    // Planned Branch commandをparserへ含めないことを検証する
-    fn rejects_planned_branch_commands() {
-        for command in ["__uninstall"] {
-            assert!(Cli::try_parse_from(["eiyah", command]).is_err());
-        }
-    }
-
-    #[test]
     // internal commandをhelp表示から隠すことを検証する
     fn hides_internal_commands_from_help() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("__install"));
+        assert!(!help.contains("__uninstall"));
         assert!(!help.contains("__handoff"));
         assert!(!help.contains("__show-cad-status-enabled"));
     }
@@ -441,6 +444,7 @@ mod tests {
                     cli,
                     || Ok(()),
                     || Ok(()),
+                    || Ok(()),
                     || result.take().unwrap(),
                     || Ok(false),
                     || Ok(false),
@@ -449,6 +453,7 @@ mod tests {
             } else {
                 run_with(
                     cli,
+                    || Ok(()),
                     || Ok(()),
                     || Ok(()),
                     || Ok(false),
@@ -465,6 +470,7 @@ mod tests {
             assert_eq!(
                 run_with(
                     cli,
+                    || Ok(()),
                     || Ok(()),
                     || Ok(()),
                     || Ok(false),
@@ -490,6 +496,7 @@ mod tests {
                 cli,
                 || Ok(()),
                 || Ok(()),
+                || Ok(()),
                 || Ok(false),
                 || Ok(false),
                 || Ok(false),
@@ -509,6 +516,7 @@ mod tests {
                 cli,
                 || Ok(()),
                 || Ok(()),
+                || Ok(()),
                 || Ok(false),
                 || Ok(false),
                 || Ok(false),
@@ -521,6 +529,7 @@ mod tests {
         assert!(
             run_with(
                 cli,
+                || Ok(()),
                 || Ok(()),
                 || Err(anyhow::anyhow!("update failed")),
                 || Ok(false),
@@ -540,6 +549,30 @@ mod tests {
         let mut called = false;
         let status = run_with(
             cli,
+            || {
+                called = true;
+                Ok(())
+            },
+            || Ok(()),
+            || Ok(()),
+            || Ok(false),
+            || Ok(false),
+            || Ok(false),
+            || Ok(0),
+        )?;
+        assert_eq!(status, 0);
+        assert!(called);
+        Ok(())
+    }
+
+    #[test]
+    // __uninstallをinternal implementationへdispatchする
+    fn dispatches_uninstall() -> Result<()> {
+        let cli = Cli::try_parse_from(["eiyah", "__uninstall"])?;
+        let mut called = false;
+        let status = run_with(
+            cli,
+            || Ok(()),
             || {
                 called = true;
                 Ok(())
