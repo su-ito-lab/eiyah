@@ -3,17 +3,23 @@
 // @brief Transaction action tracking and rollback
 // ==================================================
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow, bail};
+
+// backup index temporary file名をprocess内で一意にする連番
+static BACKUP_INDEX_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// backup indexとtemporary fileのpermission
+const BACKUP_INDEX_MODE: u32 = 0o600;
 
 /// rollback対象として記録する成功済みoperation
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +39,17 @@ pub enum Action {
         from: PathBuf,
         /// move後のpath
         to: PathBuf,
+    },
+    /// HOME backupと対応index entry
+    BackedUp {
+        /// backup前のHOME path
+        from: PathBuf,
+        /// backup tree内のpath
+        to: PathBuf,
+        /// backup index path
+        index: PathBuf,
+        /// lowercase hexでencodeしたindex entry
+        entry: Vec<u8>,
     },
     /// transaction中にStowしたpackage名
     Stowed {
@@ -191,6 +208,12 @@ fn undo(
             recursive,
         } => remove_created_path(&path, identity, recursive),
         Action::Moved { from, to } => restore_moved_path(&from, &to),
+        Action::BackedUp {
+            from,
+            to,
+            index,
+            entry,
+        } => rollback_backup(&from, &to, &index, &entry),
         Action::Stowed {
             package,
             executable,
@@ -198,6 +221,214 @@ fn undo(
             target,
         } => unstow(&package, &executable, &dir, &target),
     }
+}
+
+// HOME backupを復元して対応index entryだけを削除する
+fn rollback_backup(from: &Path, to: &Path, index: &Path, entry: &[u8]) -> Result<()> {
+    rollback_backup_with(
+        from,
+        to,
+        index,
+        entry,
+        |_| Ok(()),
+        |path, entries| write_backup_index(path, entries),
+    )
+}
+
+// source raceとindex更新failureをtest可能にしてHOME backupをrollbackする
+fn rollback_backup_with(
+    from: &Path,
+    to: &Path,
+    index: &Path,
+    entry: &[u8],
+    before_rename: impl FnOnce(&Path) -> Result<()>,
+    update_index: impl FnOnce(&Path, &[Vec<u8>]) -> Result<()>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(to)?;
+    let file_type = metadata.file_type();
+    if !(file_type.is_file() || file_type.is_dir() || file_type.is_symlink()) {
+        bail!("backup source has unsupported type: {}", to.display());
+    }
+    match fs::symlink_metadata(from) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => bail!(
+            "backup restore destination already exists: {}",
+            from.display()
+        ),
+        Err(error) => return Err(error.into()),
+    }
+    let mut entries =
+        read_backup_index(index)?.ok_or_else(|| anyhow!("backup index is missing"))?;
+    if entries
+        .iter()
+        .filter(|candidate| candidate.as_slice() == entry)
+        .count()
+        != 1
+    {
+        bail!("backup index must contain the recorded entry exactly once");
+    }
+    let identity = PathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    before_rename(to)?;
+    if PathIdentity::from_path(to)? != identity {
+        bail!("backup source identity changed: {}", to.display());
+    }
+    rename_without_replace(to, from)?;
+    entries.retain(|candidate| candidate.as_slice() != entry);
+    update_index(index, &entries)?;
+    Ok(())
+}
+
+/// HOME-relative path bytesをbackup index entryへencodeする
+pub(crate) fn encode_backup_index_entry(path: &Path) -> Result<Vec<u8>> {
+    validate_relative_backup_path(path)?;
+    let mut encoded = Vec::with_capacity(path.as_os_str().as_bytes().len() * 2);
+    for byte in path.as_os_str().as_bytes() {
+        encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    Ok(encoded)
+}
+
+/// backup index entryを検証済みHOME-relative pathへdecodeする
+pub(crate) fn decode_backup_index_entry(entry: &[u8]) -> Result<PathBuf> {
+    if entry.is_empty() || entry.len() % 2 != 0 || !entry.iter().all(u8::is_ascii_hexdigit) {
+        bail!("backup index entry must be non-empty lowercase hexadecimal");
+    }
+    if entry.iter().any(u8::is_ascii_uppercase) {
+        bail!("backup index entry must use lowercase hexadecimal");
+    }
+    let mut decoded = Vec::with_capacity(entry.len() / 2);
+    for pair in entry.chunks_exact(2) {
+        let text = std::str::from_utf8(pair)?;
+        decoded.push(u8::from_str_radix(text, 16)?);
+    }
+    let path = PathBuf::from(OsString::from_vec(decoded));
+    validate_relative_backup_path(&path)?;
+    Ok(path)
+}
+
+// HOME-relative backup pathがabsoluteまたはdot componentを含まないことを保証する
+fn validate_relative_backup_path(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || path.is_absolute() {
+        bail!("backup path must be a non-empty relative path");
+    }
+    if bytes.contains(&0) {
+        bail!("backup path must not contain a NUL byte");
+    }
+    if bytes
+        .split(|byte| *byte == b'/')
+        .any(|component| component == b"." || component == b"..")
+    {
+        bail!("backup path must not contain dot components");
+    }
+    Ok(())
+}
+
+/// backup indexを検証しencoded entryを順序通り返す
+pub(crate) fn read_backup_index(path: &Path) -> Result<Option<Vec<Vec<u8>>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("backup index must be a regular file: {}", path.display());
+    }
+    let content = fs::read(path)?;
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        bail!("backup index entry must end with LF");
+    }
+    let mut entries = Vec::new();
+    if content.is_empty() {
+        return Ok(Some(entries));
+    }
+    for entry in content[..content.len().saturating_sub(1)].split(|byte| *byte == b'\n') {
+        decode_backup_index_entry(entry)?;
+        if entries.iter().any(|existing: &Vec<u8>| existing == entry) {
+            bail!("backup index contains a duplicate entry");
+        }
+        entries.push(entry.to_vec());
+    }
+    Ok(Some(entries))
+}
+
+/// backup indexへ重複しないentryをatomicに追加する
+pub(crate) fn append_backup_index_entry(path: &Path, entry: &[u8]) -> Result<()> {
+    decode_backup_index_entry(entry)?;
+    let mut entries = read_backup_index(path)?.unwrap_or_default();
+    if entries.iter().any(|existing| existing == entry) {
+        bail!("backup index already contains the entry");
+    }
+    entries.push(entry.to_vec());
+    write_backup_index(path, &entries)
+}
+
+// backup index全体をsame-directory temporary fileからatomic置換する
+pub(crate) fn write_backup_index(path: &Path, entries: &[Vec<u8>]) -> Result<()> {
+    write_backup_index_with(path, entries, |_| Ok(()))
+}
+
+// rename直前のtemporary replacement raceをtest可能にしてindexを保存する
+fn write_backup_index_with(
+    path: &Path,
+    entries: &[Vec<u8>],
+    before_rename: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("backup index has no parent"))?;
+    let mut temporary_name = OsString::from(".index.tmp-");
+    temporary_name.push(format!(
+        "{}-{}",
+        std::process::id(),
+        BACKUP_INDEX_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary = parent.join(temporary_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(BACKUP_INDEX_MODE)
+        .open(&temporary)?;
+    let created = file.metadata()?;
+    let result = (|| -> Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(BACKUP_INDEX_MODE))?;
+        for entry in entries {
+            decode_backup_index_entry(entry)?;
+            file.write_all(entry)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        before_rename(&temporary)?;
+        let current = fs::symlink_metadata(&temporary)?;
+        if current.dev() != created.dev() || current.ino() != created.ino() {
+            bail!("backup index temporary file was replaced");
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    bail!("backup index must be a regular file: {}", path.display());
+                }
+                fs::rename(&temporary, path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                rename_without_replace(&temporary, path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        if let Ok(current) = fs::symlink_metadata(&temporary)
+            && current.dev() == created.dev()
+            && current.ino() == created.ino()
+        {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+    result
 }
 
 // 作成済みpathをfile typeに応じて削除する
@@ -283,6 +514,7 @@ fn build_unstow_command(package: &str, executable: &Path, dir: &Path, target: &P
 mod tests {
     use std::env;
     use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -392,6 +624,169 @@ mod tests {
 
         assert_eq!(fs::read(&original)?, b"original");
         assert!(!moved.exists());
+        Ok(())
+    }
+
+    #[test]
+    // backup indexがnon-UTF-8 path bytesをlosslessにencode・decodeする
+    fn backup_index_round_trips_relative_path_bytes() -> Result<()> {
+        let relative = PathBuf::from(OsString::from_vec(b".config/\xff-file".to_vec()));
+        let encoded = encode_backup_index_entry(&relative)?;
+        assert!(
+            encoded
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        );
+        assert_eq!(decode_backup_index_entry(&encoded)?, relative);
+        for invalid in [Path::new(""), Path::new("/absolute"), Path::new("a/../b")] {
+            assert!(encode_backup_index_entry(invalid).is_err());
+        }
+        assert!(decode_backup_index_entry(b"ABCDEF").is_err());
+        assert!(decode_backup_index_entry(b"0").is_err());
+        assert!(decode_backup_index_entry(b"7a00").is_err());
+        Ok(())
+    }
+
+    #[test]
+    // commit前に置換された他者所有temporary fileをrenameもcleanupもしない
+    fn preserves_replaced_backup_index_temporary_file() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let index = directory.path.join("index");
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        let mut replacement = None;
+
+        assert!(
+            write_backup_index_with(&index, &[entry], |temporary| {
+                fs::remove_file(temporary)?;
+                fs::write(temporary, b"concurrent temporary")?;
+                replacement = Some(temporary.to_path_buf());
+                Ok(())
+            })
+            .is_err()
+        );
+
+        let replacement = replacement.unwrap();
+        assert_eq!(fs::read(&replacement)?, b"concurrent temporary");
+        assert!(!index.exists());
+        Ok(())
+    }
+
+    #[test]
+    // BackedUp rollbackがHOMEを復元して対応index entryだけを削除する
+    fn backed_up_action_restores_path_and_updates_index() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home_path = directory.path.join("home/.cshrc");
+        let backup = directory.path.join("state/backup/home/.cshrc");
+        let index = directory.path.join("state/backup/index");
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::create_dir_all(home_path.parent().unwrap())?;
+        fs::write(&backup, b"original")?;
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        let other = encode_backup_index_entry(Path::new(".config/other"))?;
+        write_backup_index(&index, &[entry.clone(), other.clone()])?;
+        assert_eq!(fs::metadata(&index)?.permissions().mode() & 0o777, 0o600);
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o644))?;
+
+        let mut transaction = Transaction::new();
+        transaction.record(Action::BackedUp {
+            from: home_path.clone(),
+            to: backup.clone(),
+            index: index.clone(),
+            entry,
+        });
+        transaction.rollback()?;
+
+        assert_eq!(fs::read(home_path)?, b"original");
+        assert!(!backup.exists());
+        assert_eq!(read_backup_index(&index)?, Some(vec![other]));
+        assert_eq!(fs::metadata(&index)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    // BackedUp restore失敗時はbackup sourceとindex entryを保持する
+    fn backed_up_rollback_preserves_state_on_restore_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home_path = directory.path.join("home/.cshrc");
+        let backup = directory.path.join("state/backup/home/.cshrc");
+        let index = directory.path.join("state/backup/index");
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::create_dir_all(home_path.parent().unwrap())?;
+        fs::write(&home_path, b"collision")?;
+        fs::write(&backup, b"original")?;
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        write_backup_index(&index, std::slice::from_ref(&entry))?;
+
+        assert!(rollback_backup(&home_path, &backup, &index, &entry).is_err());
+        assert_eq!(fs::read(&home_path)?, b"collision");
+        assert_eq!(fs::read(&backup)?, b"original");
+        assert_eq!(read_backup_index(&index)?, Some(vec![entry]));
+        Ok(())
+    }
+
+    #[test]
+    // index更新failure後もHOMEへ復元済みpathをbackupへ戻さない
+    fn backed_up_rollback_keeps_restored_path_after_index_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home_path = directory.path.join("home/.cshrc");
+        let backup = directory.path.join("state/backup/home/.cshrc");
+        let index = directory.path.join("state/backup/index");
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::create_dir_all(home_path.parent().unwrap())?;
+        fs::write(&backup, b"original")?;
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        write_backup_index(&index, std::slice::from_ref(&entry))?;
+
+        assert!(
+            rollback_backup_with(
+                &home_path,
+                &backup,
+                &index,
+                &entry,
+                |_| Ok(()),
+                |_, _| Err(anyhow!("injected index failure")),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&home_path)?, b"original");
+        assert!(!backup.exists());
+        assert_eq!(read_backup_index(&index)?, Some(vec![entry]));
+        Ok(())
+    }
+
+    #[test]
+    // BackedUp source replacement raceで他者所有pathを移動しない
+    fn backed_up_rollback_rejects_source_identity_change() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home_path = directory.path.join("home/.cshrc");
+        let backup = directory.path.join("state/backup/home/.cshrc");
+        let original = directory.path.join("original");
+        let index = directory.path.join("state/backup/index");
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::create_dir_all(home_path.parent().unwrap())?;
+        fs::write(&backup, b"original")?;
+        let entry = encode_backup_index_entry(Path::new(".cshrc"))?;
+        write_backup_index(&index, std::slice::from_ref(&entry))?;
+
+        assert!(
+            rollback_backup_with(
+                &home_path,
+                &backup,
+                &index,
+                &entry,
+                |source| {
+                    fs::rename(source, &original)?;
+                    fs::write(source, b"other owner")?;
+                    Ok(())
+                },
+                |_, _| unreachable!(),
+            )
+            .is_err()
+        );
+        assert!(!home_path.exists());
+        assert_eq!(fs::read(&backup)?, b"other owner");
+        assert_eq!(fs::read(&original)?, b"original");
+        assert_eq!(read_backup_index(&index)?, Some(vec![entry]));
         Ok(())
     }
 
