@@ -4,10 +4,11 @@
 // ==================================================
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,6 +304,176 @@ pub fn save_install_metadata(paths: &ResolvedPaths) -> Result<()> {
     )
 }
 
+/// 初回install用metadataを既存targetを置換せずに作成する
+pub fn create_install_metadata(paths: &ResolvedPaths) -> Result<()> {
+    create_install_metadata_with(paths, |_| Ok(()))
+}
+
+// commit直前のraceをtest可能にしつつ初回install用metadataを保存する
+fn create_install_metadata_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let metadata = InstallMetadata::from(paths);
+    metadata.validate()?;
+    let contents =
+        toml::to_string(&metadata).context("failed to serialize installation metadata")?;
+    let target = paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME);
+    create_initial_file_with(&target, contents.as_bytes(), before_commit)
+}
+
+/// 初回install用configを`show-cad-status = true`で新規作成する
+pub fn create_initial_config(paths: &ResolvedPaths) -> Result<()> {
+    create_initial_config_with(paths, |_| Ok(()))
+}
+
+// commit直前のraceをtest可能にしてinitial configを作成する
+fn create_initial_config_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let contents = toml::to_string(&Config {
+        show_cad_status: true,
+    })
+    .context("failed to serialize initial config")?;
+    create_initial_file_with(&paths.eiyah_config, contents.as_bytes(), before_commit)
+}
+
+// same-directory temporary fileからinitial targetをatomic no-replaceで作成する
+fn create_initial_file_with<F>(target: &Path, contents: &[u8], before_commit: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_initial_target(&target)?;
+
+    let parent = target
+        .parent()
+        .with_context(|| format!("target has no parent directory: {}", target.display()))?;
+    validate_existing_directory(parent)?;
+    let file_name = target
+        .file_name()
+        .with_context(|| format!("target has no file name: {}", target.display()))?;
+    let (temporary_path, mut temporary_file) = create_temporary_file(parent, file_name)?;
+    // cleanupとcommitを今回create_newしたinodeへ限定するためのidentity
+    let created_temporary = temporary_file.metadata().with_context(|| {
+        format!(
+            "failed to inspect temporary file: {}",
+            temporary_path.display()
+        )
+    })?;
+
+    let result = (|| -> Result<()> {
+        temporary_file
+            .set_permissions(fs::Permissions::from_mode(TEMP_FILE_MODE))
+            .with_context(|| {
+                format!(
+                    "failed to set temporary file permissions: {}",
+                    temporary_path.display()
+                )
+            })?;
+        temporary_file.write_all(contents).with_context(|| {
+            format!(
+                "failed to write temporary file: {}",
+                temporary_path.display()
+            )
+        })?;
+        temporary_file.sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary file: {}",
+                temporary_path.display()
+            )
+        })?;
+        validate_initial_target(&target)?;
+        before_commit(&temporary_path)?;
+        validate_same_inode(&temporary_path, &created_temporary)?;
+        rename_without_replace(&temporary_path, &target).with_context(|| {
+            format!(
+                "failed to create installation metadata: {}",
+                target.display()
+            )
+        })
+    })();
+
+    if result.is_err() {
+        let _ = remove_file_if_same_inode(&temporary_path, &created_temporary);
+    }
+    result
+}
+
+// pathが作成時と同じinodeを指す場合だけtemporary fileをcleanupする
+fn remove_file_if_same_inode(path: &Path, created: &fs::Metadata) -> io::Result<()> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if same_inode(&current, created) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+// temporary pathが今回作成したinodeのままであることを保証する
+fn validate_same_inode(path: &Path, created: &fs::Metadata) -> Result<()> {
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect temporary file: {}", path.display()))?;
+    if !same_inode(&current, created) {
+        bail!("temporary file was replaced: {}", path.display());
+    }
+    Ok(())
+}
+
+// filesystem deviceとinodeで同一fileを判定する
+fn same_inode(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+// initial install targetが種類を問わず存在しないことを保証する
+fn validate_initial_target(target: &Path) -> Result<()> {
+    match fs::symlink_metadata(target) {
+        Ok(_) => bail!(
+            "initial install target already exists: {}",
+            target.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect initial target: {}", target.display())),
+    }
+}
+
+// metadata parentが既存のnon-symlink directoryであることを保証する
+fn validate_existing_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect directory: {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("path must be a non-symlink directory: {}", path.display());
+    }
+    Ok(())
+}
+
+// Linuxのrenameat2でfinal targetのatomic no-replaceを保証する
+fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("source path contains a NUL byte"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("destination path contains a NUL byte"))?;
+
+    // SAFETY: 両pathはNUL終端済みで、有効なpointerをcall完了まで保持する
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 // 同一directoryのtemporary fileを介して、通常fileだけをatomic置換する
 fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
     validate_replace_target(target)?;
@@ -315,6 +486,13 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("target has no file name: {}", target.display()))?;
     // renameのatomicityを保つため、targetと同一filesystem上へ作成する
     let (temporary_path, mut temporary_file) = create_temporary_file(parent, file_name)?;
+    // replacement検知とcleanupを今回create_newしたinodeへ限定するidentity
+    let created_temporary = temporary_file.metadata().with_context(|| {
+        format!(
+            "failed to inspect temporary file: {}",
+            temporary_path.display()
+        )
+    })?;
 
     // 途中失敗時のtemporary file cleanupを共通化するため結果を保持する
     let result = (|| -> Result<()> {
@@ -338,9 +516,8 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
                 temporary_path.display()
             )
         })?;
-        drop(temporary_file);
-
         validate_replace_target(target)?;
+        validate_same_inode(&temporary_path, &created_temporary)?;
         fs::rename(&temporary_path, target).with_context(|| {
             format!(
                 "failed to replace {} with {}",
@@ -352,7 +529,7 @@ fn atomic_save(target: &Path, contents: &[u8]) -> Result<()> {
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = remove_file_if_same_inode(&temporary_path, &created_temporary);
     }
     result
 }
@@ -1085,6 +1262,117 @@ mod tests {
         let _lock = LockGuard::acquire(&paths.state_home)?;
         assert!(set_show_cad_status_from_home(&home, false).is_err());
         assert!(load_config(&paths.eiyah_config)?.show_cad_status);
+        Ok(())
+    }
+
+    #[test]
+    // 初回install metadataを4 pathだけでmode 0600の新規fileとして作成する
+    fn creates_initial_install_metadata_without_replacement() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+
+        create_install_metadata(&paths)?;
+
+        let target = paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME);
+        assert_eq!(
+            load_install_metadata(&target)?,
+            InstallMetadata::from(&paths)
+        );
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o600);
+        assert!(create_install_metadata(&paths).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // commit直前に出現したmetadataを上書きせず所有temporary fileだけをcleanupする
+    fn preserves_install_metadata_created_during_commit_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let target = paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME);
+
+        assert!(
+            create_install_metadata_with(&paths, |_| {
+                fs::write(&target, b"concurrent metadata")?;
+                Ok(())
+            })
+            .is_err()
+        );
+
+        assert_eq!(fs::read(&target)?, b"concurrent metadata");
+        assert!(fs::read_dir(&paths.eiyah_prefix)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".install.toml.tmp-")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    // commit前に置換された他者所有temporary fileをcommitもcleanupもしない
+    fn preserves_replaced_install_metadata_temporary_file() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(&paths.eiyah_prefix)?;
+        let mut replacement = None;
+
+        assert!(
+            create_install_metadata_with(&paths, |temporary| {
+                fs::remove_file(temporary)?;
+                fs::write(temporary, b"concurrent temporary")?;
+                replacement = Some(temporary.to_path_buf());
+                Ok(())
+            })
+            .is_err()
+        );
+
+        let replacement = replacement.unwrap();
+        assert_eq!(fs::read(&replacement)?, b"concurrent temporary");
+        assert!(!paths.eiyah_prefix.join(INSTALL_METADATA_FILE_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    // initial configを明示的なtrueとmode 0600でatomic no-replace作成する
+    fn creates_initial_config_without_replacement() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+
+        create_initial_config(&paths)?;
+
+        assert_eq!(
+            load_config(&paths.eiyah_config)?,
+            Config {
+                show_cad_status: true
+            }
+        );
+        assert_eq!(
+            fs::metadata(&paths.eiyah_config)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(create_initial_config(&paths).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // config commit raceでexisting targetを上書きせずtemporaryだけをcleanupする
+    fn preserves_initial_config_created_during_race() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = paths_under(&directory.path);
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+
+        assert!(
+            create_initial_config_with(&paths, |_| {
+                fs::write(&paths.eiyah_config, b"concurrent config")?;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&paths.eiyah_config)?, b"concurrent config");
         Ok(())
     }
 }
