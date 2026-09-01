@@ -5,6 +5,7 @@
 # @brief Installation bootstrap contract tests
 # ==================================================
 
+
 set -u
 set -o pipefail
 
