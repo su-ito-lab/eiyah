@@ -5,6 +5,7 @@
 
 use std::env;
 use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
 use anyhow::{Context, Result, bail};
@@ -43,7 +44,11 @@ enum Command {
     Install,
     // managed environmentを削除するinternal command
     #[command(name = "__uninstall", hide = true)]
-    Uninstall,
+    Uninstall {
+        // shell bootstrapへ返すfinal cleanup plan path
+        #[arg(long, value_name = "PATH")]
+        cleanup_plan: PathBuf,
+    },
     // Public ReleaseからEiyah binaryを更新する
     Update,
     // Eiyahとsystem configurationを表示する
@@ -102,7 +107,7 @@ fn run(cli: Cli) -> Result<u8> {
 fn run_with(
     cli: Cli,
     mut install: impl FnMut() -> Result<()>,
-    mut uninstall: impl FnMut() -> Result<()>,
+    mut uninstall: impl FnMut(&Path) -> Result<()>,
     mut update: impl FnMut() -> Result<()>,
     mut handoff: impl FnMut() -> Result<bool>,
     mut show_cad_status_enabled: impl FnMut() -> Result<bool>,
@@ -114,8 +119,8 @@ fn run_with(
             install()?;
             Ok(0)
         }
-        Command::Uninstall => {
-            uninstall()?;
+        Command::Uninstall { cleanup_plan } => {
+            uninstall(&cleanup_plan)?;
             Ok(0)
         }
         Command::Update => {
@@ -213,7 +218,7 @@ mod tests {
         for arguments in [
             vec!["eiyah", "update"],
             vec!["eiyah", "__install"],
-            vec!["eiyah", "__uninstall"],
+            vec!["eiyah", "__uninstall", "--cleanup-plan", "/tmp/plan"],
             vec!["eiyah", "config"],
             vec!["eiyah", "doctor"],
             vec!["eiyah", "show-cad-status"],
@@ -257,7 +262,7 @@ mod tests {
                 run_with(
                     cli,
                     || Ok(()),
-                    || Ok(()),
+                    |_| Ok(()),
                     || Ok(()),
                     || result.take().unwrap(),
                     || Ok(false),
@@ -268,7 +273,7 @@ mod tests {
                 run_with(
                     cli,
                     || Ok(()),
-                    || Ok(()),
+                    |_| Ok(()),
                     || Ok(()),
                     || Ok(false),
                     || result.take().unwrap(),
@@ -285,7 +290,7 @@ mod tests {
                 run_with(
                     cli,
                     || Ok(()),
-                    || Ok(()),
+                    |_| Ok(()),
                     || Ok(()),
                     || Ok(false),
                     || Ok(false),
@@ -309,7 +314,7 @@ mod tests {
             run_with(
                 cli,
                 || Ok(()),
-                || Ok(()),
+                |_| Ok(()),
                 || Ok(()),
                 || Ok(false),
                 || Ok(false),
@@ -329,7 +334,7 @@ mod tests {
             run_with(
                 cli,
                 || Ok(()),
-                || Ok(()),
+                |_| Ok(()),
                 || Ok(()),
                 || Ok(false),
                 || Ok(false),
@@ -344,7 +349,7 @@ mod tests {
             run_with(
                 cli,
                 || Ok(()),
-                || Ok(()),
+                |_| Ok(()),
                 || Err(anyhow::anyhow!("update failed")),
                 || Ok(false),
                 || Ok(false),
@@ -367,7 +372,7 @@ mod tests {
                 called = true;
                 Ok(())
             },
-            || Ok(()),
+            |_| Ok(()),
             || Ok(()),
             || Ok(false),
             || Ok(false),
@@ -382,13 +387,20 @@ mod tests {
     #[test]
     // __uninstallをinternal implementationへdispatchする
     fn dispatches_uninstall() -> Result<()> {
-        let cli = Cli::try_parse_from(["eiyah", "__uninstall"])?;
+        let cli = Cli::try_parse_from([
+            "eiyah",
+            "__uninstall",
+            "--cleanup-plan",
+            "/tmp/uninstall-plan",
+        ])?;
         let mut called = false;
+        let mut received = None;
         let status = run_with(
             cli,
             || Ok(()),
-            || {
+            |cleanup_plan| {
                 called = true;
+                received = Some(cleanup_plan.to_path_buf());
                 Ok(())
             },
             || Ok(()),
@@ -399,6 +411,7 @@ mod tests {
         )?;
         assert_eq!(status, 0);
         assert!(called);
+        assert_eq!(received, Some(PathBuf::from("/tmp/uninstall-plan")));
         Ok(())
     }
 }

@@ -3,10 +3,10 @@
 // @brief Managed environment removal and backup restoration
 // ==================================================
 
-use std::fs::{self, DirBuilder};
-use std::io;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -435,16 +435,16 @@ fn cleanup_backup_directory(directory: &Path) -> Result<bool> {
 // --------------------------------------------------
 
 /// install metadata由来pathだけを使用してmanaged environmentを削除する
-pub(crate) fn run_uninstall() -> Result<()> {
+pub(crate) fn run_uninstall(cleanup_plan: &Path) -> Result<()> {
     let home = runtime_home()?;
-    run_uninstall_from_home(&home)
+    run_uninstall_from_home(&home, cleanup_plan)
 }
 
 // HOMEを差し替え可能にしてmetadata復元からlock・uninstallまで実行する
-fn run_uninstall_from_home(home: &Path) -> Result<()> {
+fn run_uninstall_from_home(home: &Path, cleanup_plan: &Path) -> Result<()> {
     let paths = load_uninstall_paths(home)?;
     let _lock = LockGuard::acquire(&paths.state_home)?;
-    uninstall_locked(&paths, home)
+    uninstall_locked(&paths, home, cleanup_plan)
 }
 
 // public entryからinstalled metadataを読みuninstall対象pathを復元する
@@ -455,14 +455,64 @@ fn load_uninstall_paths(home: &Path) -> Result<ResolvedPaths> {
 }
 
 // lock取得後のuninstall処理を仕様順に実行する
-fn uninstall_locked(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+fn uninstall_locked(paths: &ResolvedPaths, home: &Path, cleanup_plan: &Path) -> Result<()> {
     uninstall_preflight(paths, home)?;
+    write_final_cleanup_plan(paths, home, cleanup_plan)?;
     unstow_managed_packages(paths, home)?;
     remove_show_cad_status_entry(paths, home)?;
     remove_managed_content(paths, home)?;
     restore_home_backups(paths, home)?;
     validate_uninstallation(paths, home)?;
     cleanup_uninstall_cache(paths)
+}
+
+// installed metadata由来pathをshell向けfixed-order protocolへ記録する
+fn write_final_cleanup_plan(paths: &ResolvedPaths, home: &Path, target: &Path) -> Result<()> {
+    if !target.is_absolute() {
+        bail!("final cleanup plan path must be absolute");
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("final cleanup plan path has no parent"))?;
+    validate_non_symlink_directory(parent, "final cleanup plan parent")?;
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("final cleanup plan already exists: {}", target.display()),
+        Err(error) => return Err(error.into()),
+    }
+
+    let eiyah_binary = paths.eiyah_prefix.join("bin/eiyah");
+    let eiyah_entry = home.join(".local/bin/eiyah");
+    let state_root = paths.state_home.join("eiyah");
+    let lock = state_root.join("lock");
+    let content = format!(
+        "eiyah-binary={}\neiyah-entry={}\nstate-root={}\nlock={}\n",
+        encode_path(&eiyah_binary),
+        encode_path(&eiyah_entry),
+        encode_path(&state_root),
+        encode_path(&lock),
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(target)
+        .with_context(|| format!("failed to create final cleanup plan {}", target.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+// Unix path bytesをlowercase hexadecimalへencodeする
+fn encode_path(path: &Path) -> String {
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 /// filesystemを変更せずuninstall開始条件を検証する
@@ -571,6 +621,7 @@ fn validate_optional_uninstall_file(path: &Path, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::{CString, OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::process::ExitStatusExt;
 
@@ -578,6 +629,13 @@ mod tests {
     use crate::transaction::{encode_backup_index_entry, write_backup_index};
 
     use super::*;
+
+    #[test]
+    // non-UTF-8を含むUnix path bytesをlowercase hexへencodeする
+    fn encodes_cleanup_plan_path_bytes() {
+        let path = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+        assert_eq!(encode_path(&path), "2fff");
+    }
 
     // fixtureのbackup indexとsource rootを作成する
     fn create_backup_fixture(
@@ -1172,7 +1230,8 @@ mod tests {
         let home = directory.path.join("home");
         create_uninstall_fixture(&paths, &home)?;
 
-        run_uninstall_from_home(&home)?;
+        let cleanup_plan = directory.path.join("uninstall-cleanup-plan");
+        run_uninstall_from_home(&home, &cleanup_plan)?;
 
         assert_eq!(fs::read(home.join(".cshrc"))?, b"restored");
         assert!(paths.eiyah_prefix.join("bin/eiyah").is_file());
@@ -1180,6 +1239,18 @@ mod tests {
         assert!(paths.state_home.join("eiyah").is_dir());
         assert!(paths.state_home.join("eiyah/lock").is_file());
         assert!(!paths.cache_home.join("eiyah").exists());
+        let expected = format!(
+            "eiyah-binary={}\neiyah-entry={}\nstate-root={}\nlock={}\n",
+            encode_path(&paths.eiyah_prefix.join("bin/eiyah")),
+            encode_path(&home.join(".local/bin/eiyah")),
+            encode_path(&paths.state_home.join("eiyah")),
+            encode_path(&paths.state_home.join("eiyah/lock")),
+        );
+        assert_eq!(fs::read_to_string(&cleanup_plan)?, expected);
+        assert_eq!(
+            fs::metadata(&cleanup_plan)?.permissions().mode() & 0o777,
+            0o600
+        );
         Ok(())
     }
 
@@ -1192,10 +1263,35 @@ mod tests {
         create_uninstall_fixture(&paths, &home)?;
         fs::remove_file(paths.eiyah_prefix.join("bin/eiyah"))?;
 
-        assert!(uninstall_locked(&paths, &home).is_err());
+        assert!(
+            uninstall_locked(
+                &paths,
+                &home,
+                &directory.path.join("uninstall-cleanup-plan"),
+            )
+            .is_err()
+        );
         assert!(paths.cache_home.join("eiyah/downloads/archive").is_file());
         assert_eq!(fs::read(home.join(".cshrc"))?, b"restored");
         assert!(paths.state_home.join("eiyah/lock").is_file());
+        Ok(())
+    }
+
+    #[test]
+    // invalidまたはexisting plan targetではdestructive uninstallを開始しない
+    fn rejects_invalid_cleanup_plan_before_uninstall() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        create_uninstall_fixture(&paths, &home)?;
+        let existing = directory.path.join("existing-plan");
+        fs::write(&existing, b"other owner")?;
+
+        assert!(uninstall_locked(&paths, &home, Path::new("relative-plan")).is_err());
+        assert!(uninstall_locked(&paths, &home, &existing).is_err());
+        assert_eq!(fs::read(&existing)?, b"other owner");
+        assert!(home.join(".dotfiles").is_dir());
+        assert!(paths.pixi_home.is_dir());
         Ok(())
     }
 }
