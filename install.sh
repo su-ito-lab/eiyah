@@ -127,8 +127,7 @@ release_tag_from_url() {
     local effective_url=$1
     local prefix=https://github.com/su-ito-lab/eiyah/releases/tag/
     local tag=${effective_url#"$prefix"}
-    local identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
-    local semver="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${identifier}(\\.${identifier})*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+    local semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
     if [[ $tag == "$effective_url" || ! $tag =~ $semver ]]; then
         error "latest Public Release URL has an invalid tag: $effective_url"
         return 1

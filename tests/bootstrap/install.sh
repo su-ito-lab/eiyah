@@ -74,8 +74,7 @@ assert_status 2 confirm_install </dev/null
 
 [[ $(release_tag_from_url 'https://github.com/su-ito-lab/eiyah/releases/tag/v1.2.3') == v1.2.3 ]] \
     || fail 'valid release tag was not parsed'
-[[ $(release_tag_from_url 'https://github.com/su-ito-lab/eiyah/releases/tag/v1.2.3-rc.1+build.2') == v1.2.3-rc.1+build.2 ]] \
-    || fail 'valid semantic version tag was not parsed'
+assert_status 1 release_tag_from_url 'https://github.com/su-ito-lab/eiyah/releases/tag/v1.2.3-rc.1'
 assert_status 1 release_tag_from_url 'https://github.com/su-ito-lab/eiyah/releases/latest'
 assert_status 1 release_tag_from_url 'https://github.com/su-ito-lab/eiyah/releases/tag/v01.2.3'
 
