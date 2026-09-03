@@ -3,8 +3,6 @@
 // @brief Eiyah command-line entry point
 // ==================================================
 
-use std::env;
-use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
@@ -21,11 +19,14 @@ pub mod handoff;
 mod lifecycle;
 /// filesystem変更の記録とrollbackを提供するmodule
 pub mod transaction;
+/// user-facing outputの共通formatを提供するmodule
+mod ui;
 
 use config::{collect_system_config, print_config, runtime_home, set_show_cad_status};
 use doctor::run_doctor;
 use handoff::{run_handoff, run_show_cad_status_enabled};
 use lifecycle::{run_install, run_uninstall, run_update};
+use ui::print_error;
 
 // 実装済みのPublic / Internal CLI
 #[derive(Debug, Parser)]
@@ -179,24 +180,6 @@ fn child_exit_status(status: std::process::ExitStatus) -> Result<u8> {
         Some(code) if (0..=u8::MAX as i32).contains(&code) => Ok(code as u8),
         Some(code) => bail!("show-cad-status returned unsupported exit status {code}"),
         None => bail!("show-cad-status terminated by signal"),
-    }
-}
-
-// stderrのTTY / NO_COLOR契約に従ってWarningを表示する
-pub(crate) fn print_warning(message: &str) {
-    if io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() {
-        eprintln!("\x1b[33mWarning:\x1b[0m {message}");
-    } else {
-        eprintln!("Warning: {message}");
-    }
-}
-
-// stderrのTTY / NO_COLOR契約に従ってErrorを表示する
-fn print_error(message: &str) {
-    if io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() {
-        eprintln!("\x1b[31mError:\x1b[0m {message}");
-    } else {
-        eprintln!("Error: {message}");
     }
 }
 

@@ -1667,7 +1667,7 @@ fn install_not_installed_flow(paths: &ResolvedPaths, home: &Path) -> Result<()> 
             )
         },
         || archive.cleanup(),
-        crate::print_warning,
+        crate::ui::print_warning,
     )
 }
 
@@ -1933,7 +1933,11 @@ fn authorize_private_repository() -> Result<String> {
         .body_mut()
         .read_json()
         .context("failed to parse GitHub device code response")?;
-    write_device_instructions(&mut io::stdout().lock(), &device)?;
+    write_device_instructions(
+        &mut io::stdout().lock(),
+        &device,
+        crate::ui::stdout_style_enabled(),
+    )?;
     poll_device_token(&agent, &device, issued_at)
 }
 
@@ -1955,8 +1959,12 @@ fn parse_private_release_response(body: &mut ureq::Body) -> Result<PrivateReleas
 }
 
 // Device Flowのuser向けinstructionだけをstdoutへ出力する
-fn write_device_instructions(output: &mut impl Write, device: &DeviceCodeResponse) -> Result<()> {
-    writeln!(output, "==> Authorize Eiyah with GitHub")?;
+fn write_device_instructions(
+    output: &mut impl Write,
+    device: &DeviceCodeResponse,
+    styled: bool,
+) -> Result<()> {
+    crate::ui::write_operation(output, "Authorize Eiyah with GitHub", styled)?;
     writeln!(output, "Open: {}", device.verification_uri)?;
     writeln!(output, "Code: {}", device.user_code)?;
     Ok(())
@@ -2605,7 +2613,7 @@ mod tests {
         );
         let device: DeviceCodeResponse = body.read_json()?;
         let mut output = Vec::new();
-        write_device_instructions(&mut output, &device)?;
+        write_device_instructions(&mut output, &device, false)?;
         let output = String::from_utf8(output)?;
 
         assert_eq!(device.expires_in, 900);

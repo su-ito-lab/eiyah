@@ -14,7 +14,7 @@ use anyhow::Result;
 use crate::config::{
     ResolvedPaths, load_config, load_installed_paths, os_release_value, runtime_home,
 };
-use crate::print_warning;
+use crate::ui::print_warning;
 
 // 全診断項目を収集しWarningまたはsuccess messageを表示する
 pub(super) fn run_doctor() -> Result<bool> {
