@@ -102,7 +102,19 @@ fn remove_managed_content(paths: &ResolvedPaths, home: &Path) -> Result<()> {
             ManagedRemovalKind::RegularFile,
         ),
     ];
-    for (path, kind) in targets {
+    for (index, (path, kind)) in targets.into_iter().enumerate() {
+        match index {
+            1 => {
+                crate::ui::print_operation("Removing Eiyah configuration")?;
+                crate::ui::print_detail(&paths.eiyah_config.display().to_string())?;
+                crate::ui::print_detail(&home.join(".dotfiles").display().to_string())?;
+            }
+            3 => {
+                crate::ui::print_operation("Removing Pixi environment")?;
+                crate::ui::print_detail(&paths.pixi_home.display().to_string())?;
+            }
+            _ => {}
+        }
         remove_managed_path(&path, kind)?;
     }
     Ok(())
@@ -202,6 +214,7 @@ fn restore_home_backups_with(
     let plan = backup_restore_plan(&entries)?;
     if !plan.is_empty() {
         validate_non_symlink_directory(&backup_root, "backup root")?;
+        crate::ui::print_operation("Restoring previous configuration")?;
     }
 
     for restore in &plan {
@@ -227,6 +240,7 @@ fn restore_home_backups_with(
                 restore.relative.as_os_str().to_string_lossy()
             );
         }
+        crate::ui::print_detail(&destination.display().to_string())?;
     }
 
     remove_backup_index_with(&index, before_index_remove)?;
@@ -458,7 +472,15 @@ fn load_uninstall_paths(home: &Path) -> Result<ResolvedPaths> {
 fn uninstall_locked(paths: &ResolvedPaths, home: &Path, cleanup_plan: &Path) -> Result<()> {
     uninstall_preflight(paths, home)?;
     write_final_cleanup_plan(paths, home, cleanup_plan)?;
+    crate::ui::print_operation("Unlinking configuration files")?;
     unstow_managed_packages(paths, home)?;
+    crate::ui::print_operation("Removing show-cad-status")?;
+    crate::ui::print_detail(
+        &home
+            .join(".local/bin/show-cad-status")
+            .display()
+            .to_string(),
+    )?;
     remove_show_cad_status_entry(paths, home)?;
     remove_managed_content(paths, home)?;
     restore_home_backups(paths, home)?;
@@ -1231,7 +1253,21 @@ mod tests {
         create_uninstall_fixture(&paths, &home)?;
 
         let cleanup_plan = directory.path.join("uninstall-cleanup-plan");
-        run_uninstall_from_home(&home, &cleanup_plan)?;
+        let (result, output) =
+            crate::ui::capture_stdout(|| run_uninstall_from_home(&home, &cleanup_plan));
+        result?;
+
+        assert_eq!(
+            output,
+            format!(
+                "\n==> Unlinking configuration files\n\n==> Removing show-cad-status\n{}\n\n==> Removing Eiyah configuration\n{}\n{}\n\n==> Removing Pixi environment\n{}\n\n==> Restoring previous configuration\n{}\n",
+                home.join(".local/bin/show-cad-status").display(),
+                paths.eiyah_config.display(),
+                home.join(".dotfiles").display(),
+                paths.pixi_home.display(),
+                home.join(".cshrc").display(),
+            )
+        );
 
         assert_eq!(fs::read(home.join(".cshrc"))?, b"restored");
         assert!(paths.eiyah_prefix.join("bin/eiyah").is_file());

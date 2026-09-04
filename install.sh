@@ -20,6 +20,7 @@ readonly BINARY_ASSET=eiyah-x86_64-unknown-linux-gnu
 readonly CHECKSUM_ASSET=eiyah-x86_64-unknown-linux-gnu.sha256
 
 attempt_directory=
+operation_started=false
 
 
 # --------------------------------------------------
@@ -34,6 +35,25 @@ error() {
 # primary resultを変えずtemporary cleanup failureを表示する
 warning() {
     printf 'Warning: %s\n' "$1" >&2
+}
+
+# lifecycle operation headingを表示する
+operation() {
+    if [[ $operation_started == true ]]; then printf '\n'; fi
+    operation_started=true
+    if [[ -t 1 && ! -v NO_COLOR ]]; then
+        printf '\033[94m==>\033[0m \033[1m%s\033[0m\n' "$1"
+    else
+        printf '==> %s\n' "$1"
+    fi
+}
+
+# install対象の種類を確認前に表示する
+install_overview() {
+    operation 'Eiyah will install:'
+    printf '%s\n' 'Eiyah' 'show-cad-status' 'Pixi environment' \
+        'Eiyah configuration' 'managed dotfiles'
+    printf '\nShell and Git settings will also be configured.\n\n'
 }
 
 
@@ -226,6 +246,7 @@ main() {
     local confirmation_status root tag binary
     validate_prerequisites || return 1
 
+    install_overview
     confirm_install
     confirmation_status=$?
     case $confirmation_status in
@@ -245,11 +266,15 @@ main() {
     trap 'exit 143' TERM
 
     tag=$(discover_release_tag) || return 1
+    operation "Downloading Eiyah ${tag#v}"
+    printf '%s/%s/%s\n' "$RELEASE_DOWNLOAD_ROOT" "$tag" "$BINARY_ASSET"
     download_release_assets "$tag" "$attempt_directory" || {
         error 'failed to download Public Release assets'
         return 1
     }
+    operation 'Verifying Eiyah download'
     verify_release_assets "$attempt_directory" || return 1
+    printf 'SHA-256: verified\n'
 
     binary=$attempt_directory/$BINARY_ASSET
     if ! "$CHMOD" 0755 "$binary"; then

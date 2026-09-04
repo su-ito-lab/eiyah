@@ -6,6 +6,15 @@
 use std::env;
 use std::io::{self, IsTerminal, Write};
 
+#[cfg(test)]
+use std::cell::RefCell;
+
+#[cfg(test)]
+thread_local! {
+    // lifecycle testがproductionのstdout経路を直接検証するためのcapture先
+    static TEST_STDOUT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
 // ANSI style reset
 const ANSI_RESET: &str = "\x1b[0m";
 // operation prefix用bright blue
@@ -46,6 +55,63 @@ pub(crate) fn write_operation(
     } else {
         writeln!(output, "==> {message}")
     }
+}
+
+// stdoutへoperation間の空行とheadingを出力する
+pub(crate) fn print_operation(message: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if TEST_STDOUT.with(|output| output.borrow().is_some()) {
+        return TEST_STDOUT.with(|output| {
+            let mut output = output.borrow_mut();
+            let output = output.as_mut().expect("test stdout is active");
+            writeln!(output)?;
+            write_operation(output, message, false)
+        });
+    }
+    let mut output = io::stdout().lock();
+    writeln!(output)?;
+    write_operation(&mut output, message, stdout_style_enabled())
+}
+
+// stdoutへ先頭の空行を伴わないoperation headingを出力する
+pub(crate) fn print_first_operation(message: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if TEST_STDOUT.with(|output| output.borrow().is_some()) {
+        return TEST_STDOUT.with(|output| {
+            write_operation(
+                output.borrow_mut().as_mut().expect("test stdout is active"),
+                message,
+                false,
+            )
+        });
+    }
+    write_operation(&mut io::stdout().lock(), message, stdout_style_enabled())
+}
+
+// stdoutへoperation detailまたは通常結果をdefault styleで出力する
+pub(crate) fn print_detail(message: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if TEST_STDOUT.with(|output| output.borrow().is_some()) {
+        return TEST_STDOUT.with(|output| {
+            writeln!(
+                output.borrow_mut().as_mut().expect("test stdout is active"),
+                "{message}"
+            )
+        });
+    }
+    writeln!(io::stdout().lock(), "{message}")
+}
+
+// lifecycleのproduction出力経路をtest thread内でcaptureする
+#[cfg(test)]
+pub(crate) fn capture_stdout<T>(run: impl FnOnce() -> T) -> (T, String) {
+    TEST_STDOUT.with(|output| {
+        assert!(output.borrow().is_none(), "test stdout capture is nested");
+        *output.borrow_mut() = Some(Vec::new());
+    });
+    let result = run();
+    let output = TEST_STDOUT.with(|output| output.borrow_mut().take().unwrap());
+    (result, String::from_utf8(output).unwrap())
 }
 
 // diagnostic labelだけへ指定styleを適用した1行を構成する

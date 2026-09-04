@@ -174,17 +174,24 @@ pub(crate) fn run_update() -> Result<()> {
     let metadata_path = discover_install_metadata(&home.join(".local/bin/eiyah"))?;
     let paths = ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)?;
     let _lock = LockGuard::acquire(&paths.state_home)?;
-    update_locked(&paths)
+    update_locked(&paths, false)
 }
 
 /// callerが保持するoperation lock内でEiyah binaryを更新する
-pub(super) fn update_locked(paths: &ResolvedPaths) -> Result<()> {
-    update_locked_with(paths, fetch_latest_release, download_to_file, download_text)
+pub(super) fn update_locked(paths: &ResolvedPaths, leading_blank: bool) -> Result<()> {
+    update_locked_with(
+        paths,
+        leading_blank,
+        fetch_latest_release,
+        download_to_file,
+        download_text,
+    )
 }
 
 // network dependencyを差し替え可能にして更新transactionを実行する
 fn update_locked_with(
     paths: &ResolvedPaths,
+    leading_blank: bool,
     mut fetch_release: impl FnMut() -> Result<ReleaseResponse>,
     mut download_binary: impl FnMut(&str, &Path) -> Result<()>,
     mut download_checksum: impl FnMut(&str) -> Result<String>,
@@ -193,10 +200,21 @@ fn update_locked_with(
         Version::parse(env!("CARGO_PKG_VERSION")).context("current package version is invalid")?;
     let response = fetch_release()?;
     let remote_version = validate_release_version(&response)?;
+    if leading_blank {
+        crate::ui::print_operation("Checking for Eiyah updates")?;
+    } else {
+        crate::ui::print_first_operation("Checking for Eiyah updates")?;
+    }
+    crate::ui::print_detail(&format!("Current: {current_version}"))?;
+    crate::ui::print_detail(&format!("Latest:  {remote_version}"))?;
     if remote_version <= current_version {
+        crate::ui::print_detail("")?;
+        crate::ui::print_detail("Eiyah is already up to date.")?;
         return Ok(());
     }
     let release = release_info(response, remote_version)?;
+    crate::ui::print_operation(&format!("Downloading Eiyah {}", release.version))?;
+    crate::ui::print_detail(&release.binary_url)?;
 
     let binary_directory = paths.eiyah_prefix.join("bin");
     let installed = binary_directory.join("eiyah");
@@ -208,6 +226,8 @@ fn update_locked_with(
         download_binary(&release.binary_url, &candidate)?;
         let checksum = parse_checksum(&download_checksum(&release.checksum_url)?)?;
         verify_checksum(&candidate, &checksum)?;
+        crate::ui::print_operation("Verifying Eiyah download")?;
+        crate::ui::print_detail("SHA-256: verified")?;
 
         let mut permissions = fs::symlink_metadata(&candidate)?.permissions();
         permissions.set_mode(CANDIDATE_EXECUTABLE_MODE);
@@ -221,11 +241,15 @@ fn update_locked_with(
         return Err(error);
     }
 
+    crate::ui::print_operation("Updating Eiyah")?;
+    crate::ui::print_detail(&installed.display().to_string())?;
     if let Err(error) = fs::rename(&candidate, &installed) {
         cleanup_candidate(&candidate);
         return Err(error.into());
     }
-    validate_eiyah_binary(&installed, &release.version)
+    validate_eiyah_binary(&installed, &release.version)?;
+    crate::ui::print_operation(&format!("Eiyah updated to {}", release.version))?;
+    Ok(())
 }
 
 // stable flagとrequired assetから更新情報を組み立てる
@@ -492,21 +516,34 @@ mod tests {
         let content = format!("#!/bin/sh\nprintf 'eiyah {version}\\n'\n");
         let checksum = checksum_text(content.as_bytes());
 
-        update_locked_with(
-            &paths,
-            || Ok(newer_release(&version)),
-            |_, path| {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(CANDIDATE_DOWNLOAD_MODE)
-                    .open(path)?;
-                file.write_all(content.as_bytes())?;
-                file.sync_all()?;
-                Ok(())
-            },
-            |_| Ok(checksum.clone()),
-        )?;
+        let (result, output) = crate::ui::capture_stdout(|| {
+            update_locked_with(
+                &paths,
+                false,
+                || Ok(newer_release(&version)),
+                |_, path| {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(CANDIDATE_DOWNLOAD_MODE)
+                        .open(path)?;
+                    file.write_all(content.as_bytes())?;
+                    file.sync_all()?;
+                    Ok(())
+                },
+                |_| Ok(checksum.clone()),
+            )
+        });
+        result?;
+
+        assert_eq!(
+            output,
+            format!(
+                "==> Checking for Eiyah updates\nCurrent: {}\nLatest:  {version}\n\n==> Downloading Eiyah {version}\nhttps://example.com/{BINARY_ASSET_NAME}\n\n==> Verifying Eiyah download\nSHA-256: verified\n\n==> Updating Eiyah\n{}\n\n==> Eiyah updated to {version}\n",
+                env!("CARGO_PKG_VERSION"),
+                paths.eiyah_prefix.join("bin/eiyah").display(),
+            )
+        );
 
         let installed = paths.eiyah_prefix.join("bin/eiyah");
         validate_eiyah_binary(&installed, &version)?;
@@ -536,6 +573,7 @@ mod tests {
         assert!(
             update_locked_with(
                 &paths,
+                false,
                 || Ok(newer_release(&version)),
                 |_, path| {
                     fs::write(path, content.as_bytes())?;
@@ -567,6 +605,7 @@ mod tests {
         assert!(
             update_locked_with(
                 &paths,
+                false,
                 || Ok(newer_release(&version)),
                 |_, path| {
                     fs::write(path, content.as_bytes())?;
@@ -590,12 +629,13 @@ mod tests {
         let paths = fixture_paths(&directory.path)?;
         let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
 
-        for version in [current.clone(), Version::new(0, 0, 0)] {
+        let (result, output) = crate::ui::capture_stdout(|| {
             update_locked_with(
                 &paths,
+                false,
                 || {
                     Ok(ReleaseResponse {
-                        tag_name: format!("v{version}"),
+                        tag_name: format!("v{current}"),
                         draft: false,
                         prerelease: false,
                         assets: Vec::new(),
@@ -603,8 +643,30 @@ mod tests {
                 },
                 |_, _| bail!("binary download must not run"),
                 |_| bail!("checksum download must not run"),
-            )?;
-        }
+            )
+        });
+        result?;
+        assert_eq!(
+            output,
+            format!(
+                "==> Checking for Eiyah updates\nCurrent: {current}\nLatest:  {current}\n\nEiyah is already up to date.\n"
+            )
+        );
+
+        update_locked_with(
+            &paths,
+            false,
+            || {
+                Ok(ReleaseResponse {
+                    tag_name: "v0.0.0".to_owned(),
+                    draft: false,
+                    prerelease: false,
+                    assets: Vec::new(),
+                })
+            },
+            |_, _| bail!("binary download must not run"),
+            |_| bail!("checksum download must not run"),
+        )?;
         Ok(())
     }
 
@@ -616,6 +678,7 @@ mod tests {
         let _lock = LockGuard::acquire(&paths.state_home)?;
         update_locked_with(
             &paths,
+            false,
             || {
                 Ok(ReleaseResponse {
                     tag_name: "v0.0.0".to_owned(),

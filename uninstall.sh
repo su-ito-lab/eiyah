@@ -64,6 +64,15 @@ confirm_uninstall() {
     done
 }
 
+# uninstall対象の種類とpreserveされるSSH stateを確認前に表示する
+uninstall_overview() {
+    operation 'Eiyah will remove:'
+    printf '%s\n' 'Eiyah' 'show-cad-status' 'Pixi environment' \
+        'Eiyah configuration' 'managed dotfiles'
+    printf '\nPreviously backed up configuration will be restored when present.\n'
+    printf 'SSH keys and authorized_keys changes will be kept.\n\n'
+}
+
 
 # --------------------------------------------------
 # Cleanup Plan
@@ -266,6 +275,7 @@ main() {
     local confirmation_status root tag binary cleanup_plan
     validate_uninstall_prerequisites || return 1
 
+    uninstall_overview
     confirm_uninstall
     confirmation_status=$?
     case $confirmation_status in
@@ -285,11 +295,15 @@ main() {
     trap 'exit 143' TERM
 
     tag=$(discover_release_tag) || return 1
+    operation "Downloading Eiyah ${tag#v}"
+    printf '%s/%s/%s\n' "$RELEASE_DOWNLOAD_ROOT" "$tag" "$BINARY_ASSET"
     download_release_assets "$tag" "$attempt_directory" || {
         error 'failed to download Public Release assets'
         return 1
     }
+    operation 'Verifying Eiyah download'
     verify_release_assets "$attempt_directory" || return 1
+    printf 'SHA-256: verified\n'
 
     binary=$attempt_directory/$BINARY_ASSET
     if ! "$CHMOD" 0755 "$binary"; then
@@ -304,7 +318,10 @@ main() {
     run_temporary_uninstall "$binary" "$cleanup_plan" || return $?
     load_cleanup_plan "$cleanup_plan" || return 1
     validate_final_cleanup || return 1
-    run_final_cleanup
+    operation 'Removing Eiyah'
+    printf '%s\n' "$cleanup_eiyah_entry"
+    run_final_cleanup || return 1
+    operation 'Eiyah uninstall complete'
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

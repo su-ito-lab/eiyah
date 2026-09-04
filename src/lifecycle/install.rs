@@ -99,6 +99,15 @@ struct PrivateReleaseInfo {
     show_cad_status_checksum_asset_id: u64,
 }
 
+// 利用者へ表示するSSH setup結果
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshSetupResult {
+    ExistingAuthorized,
+    CreatedPublic { authorization_added: bool },
+    Generated { authorization_added: bool },
+    ExistingAuthorizedAdded,
+}
+
 // --------------------------------------------------
 // Eiyah Installation Paths
 // --------------------------------------------------
@@ -1496,6 +1505,7 @@ fn download_private_archive(
         let mut response = private_request(&agent, url, token).call()?;
         io::copy(&mut response.body_mut().as_reader(), &mut file)?;
         file.sync_all()?;
+        crate::ui::print_operation("Extracting configuration")?;
         extract_private_archive(&archive_path, &archive.core_root)
     })();
     result.map(|_| archive)
@@ -1597,7 +1607,7 @@ pub(crate) fn run_install() -> Result<()> {
         initial_state,
         || LockGuard::acquire(&paths.state_home),
         || detect_install_state(&paths, &public_entry),
-        || update_locked(&paths),
+        || update_locked(&paths, true),
         || install_not_installed_flow(&paths, &home),
     )
 }
@@ -1638,10 +1648,14 @@ fn route_install_state<Lock>(
     }
     let _lock = acquire_lock()?;
     if initial_state == InstallState::Installed {
+        crate::ui::print_operation("Eiyah is already installed")?;
         return update();
     }
     match detect_locked_state()? {
-        InstallState::Installed => update(),
+        InstallState::Installed => {
+            crate::ui::print_operation("Eiyah is already installed")?;
+            update()
+        }
         InstallState::Partial => bail!("Eiyah installation is partial"),
         InstallState::NotInstalled => install(),
     }
@@ -1649,10 +1663,16 @@ fn route_install_state<Lock>(
 
 // authenticated Private artifactを取得してtransaction境界内のinitial installを完了する
 fn install_not_installed_flow(paths: &ResolvedPaths, home: &Path) -> Result<()> {
+    crate::ui::print_operation("Authorizing with GitHub")?;
     let token = authorize_private_repository()?;
     let release = fetch_private_release(&token)?;
+    crate::ui::print_operation("Downloading configuration")?;
+    crate::ui::print_detail(&release.tag_name)?;
+    crate::ui::print_detail(&release.archive_url)?;
     let archive = download_private_archive(&paths, &token, &release.archive_url)?;
-    bootstrap_ssh(&home)?;
+    crate::ui::print_operation("Setting up SSH")?;
+    let ssh = bootstrap_ssh(home)?;
+    print_ssh_setup(home, ssh)?;
     let mut transaction = Transaction::new();
     complete_install_transaction(
         &mut transaction,
@@ -1713,6 +1733,42 @@ fn install_not_installed(
     release: &PrivateReleaseInfo,
     transaction: &mut Transaction,
 ) -> Result<()> {
+    install_not_installed_with(
+        paths,
+        home,
+        core_root,
+        token,
+        release,
+        transaction,
+        prepare_pixi,
+        sync_pixi,
+        create_git_config_local,
+        run_stow_package,
+        install_show_cad_status,
+    )
+}
+
+// external install boundaryを差し替え可能にしてinitial installを実行する
+fn install_not_installed_with<PreparePixi, SyncPixi, CreateGit, RunStow, InstallStatus>(
+    paths: &ResolvedPaths,
+    home: &Path,
+    core_root: &Path,
+    token: &str,
+    release: &PrivateReleaseInfo,
+    transaction: &mut Transaction,
+    prepare_pixi: PreparePixi,
+    sync_pixi: SyncPixi,
+    create_git_config: CreateGit,
+    mut run_stow: RunStow,
+    install_status: InstallStatus,
+) -> Result<()>
+where
+    PreparePixi: FnOnce(&ResolvedPaths, &Path) -> Result<CreatedManagedRoot>,
+    SyncPixi: FnOnce(&ResolvedPaths) -> Result<()>,
+    CreateGit: FnOnce(&Path) -> Result<PathBuf>,
+    RunStow: FnMut(&ResolvedPaths, &Path, &OsStr) -> Result<()>,
+    InstallStatus: FnOnce(&ResolvedPaths, &str, u64, u64) -> Result<PathBuf>,
+{
     for directory in [
         paths.eiyah_prefix.clone(),
         paths.eiyah_prefix.join("bin"),
@@ -1722,6 +1778,8 @@ fn install_not_installed(
             record_created(transaction, created, false)?;
         }
     }
+    crate::ui::print_operation("Installing Eiyah")?;
+    crate::ui::print_detail(&home.join(".local/bin/eiyah").display().to_string())?;
     install_running_eiyah_binary(paths)?;
     record_created(transaction, paths.eiyah_prefix.join("bin/eiyah"), false)?;
     let entry = create_eiyah_public_entry(paths, home)?;
@@ -1729,18 +1787,24 @@ fn install_not_installed(
     create_install_metadata(paths)?;
     record_created(transaction, paths.eiyah_prefix.join("install.toml"), false)?;
 
+    crate::ui::print_operation("Installing Pixi")?;
+    crate::ui::print_detail(&paths.pixi_home.display().to_string())?;
     let pixi = prepare_pixi(paths, core_root)?;
     transaction.record(Action::Created {
         path: pixi.path,
         identity: pixi.identity,
         recursive: true,
     });
+    crate::ui::print_operation("Syncing packages")?;
     sync_pixi(paths)?;
 
+    crate::ui::print_operation("Configuring shell and Git")?;
+    crate::ui::print_detail(&home.join(".dotfiles").display().to_string())?;
     validate_private_source(core_root)?;
     prepare_backup_root(&paths.state_home)?;
     let dotfiles = home.join(".dotfiles");
     if let Some(moved) = backup_home_path(home, &paths.state_home, &dotfiles)? {
+        crate::ui::print_detail(&format!("Backed up: {}", moved.from.display()))?;
         transaction.record(Action::BackedUp {
             from: moved.from,
             to: moved.to,
@@ -1749,11 +1813,13 @@ fn install_not_installed(
         });
     }
     let dotfiles = install_dotfiles(core_root, home)?;
+    crate::ui::print_detail("Installing dotfiles.")?;
     record_created(transaction, dotfiles.clone(), true)?;
-    create_git_config_local(&dotfiles)?;
+    create_git_config(&dotfiles)?;
     let packages = stow_packages(paths, &dotfiles)?;
     for conflict in stow_conflicts(&dotfiles, home, &packages)? {
         if let Some(moved) = backup_home_path(home, &paths.state_home, &conflict)? {
+            crate::ui::print_detail(&format!("Backed up: {}", moved.from.display()))?;
             transaction.record(Action::BackedUp {
                 from: moved.from,
                 to: moved.to,
@@ -1763,8 +1829,9 @@ fn install_not_installed(
         }
     }
     let stow = paths.pixi_home.join("bin/stow");
+    crate::ui::print_detail("Linking configuration files.")?;
     for package in &packages {
-        run_stow_package(paths, home, package)?;
+        run_stow(paths, home, package)?;
         transaction.record(Action::Stowed {
             package: package.to_string_lossy().into_owned(),
             executable: stow.clone(),
@@ -1773,12 +1840,23 @@ fn install_not_installed(
         });
     }
     validate_stowed_cshrc(&dotfiles, home)?;
-    let status = install_show_cad_status(
+    crate::ui::print_operation("Installing show-cad-status")?;
+    crate::ui::print_detail(&release.tag_name)?;
+    crate::ui::print_detail(&private_asset_url(release.show_cad_status_asset_id))?;
+    crate::ui::print_detail(
+        &home
+            .join(".local/bin/show-cad-status")
+            .display()
+            .to_string(),
+    )?;
+    let status = install_status(
         paths,
         token,
         release.show_cad_status_asset_id,
         release.show_cad_status_checksum_asset_id,
     )?;
+    crate::ui::print_operation("Verifying show-cad-status download")?;
+    crate::ui::print_detail("SHA-256: verified")?;
     record_created(transaction, status, false)?;
     let status_entry = create_show_cad_status_entry(paths, home)?;
     record_created(transaction, status_entry, false)?;
@@ -1789,9 +1867,14 @@ fn install_not_installed(
     for created in create_install_directories(config_parent)? {
         record_created(transaction, created, false)?;
     }
+    crate::ui::print_operation("Creating Eiyah config")?;
+    crate::ui::print_detail(&paths.eiyah_config.display().to_string())?;
     create_initial_config(paths)?;
     record_created(transaction, paths.eiyah_config.clone(), false)?;
-    validate_installation(paths, home)
+    crate::ui::print_operation("Verifying installation")?;
+    validate_installation(paths, home)?;
+    crate::ui::print_operation("Eiyah installation complete")?;
+    Ok(())
 }
 
 // path identityを取得してCreated Actionを即時記録する
@@ -1933,12 +2016,10 @@ fn authorize_private_repository() -> Result<String> {
         .body_mut()
         .read_json()
         .context("failed to parse GitHub device code response")?;
-    write_device_instructions(
-        &mut io::stdout().lock(),
-        &device,
-        crate::ui::stdout_style_enabled(),
-    )?;
-    poll_device_token(&agent, &device, issued_at)
+    write_device_instructions(&mut io::stdout().lock(), &device)?;
+    let token = poll_device_token(&agent, &device, issued_at)?;
+    crate::ui::print_detail("Authorization complete.")?;
+    Ok(token)
 }
 
 /// authenticated GitHub APIからlatest stable Private Release情報を取得する
@@ -1959,14 +2040,18 @@ fn parse_private_release_response(body: &mut ureq::Body) -> Result<PrivateReleas
 }
 
 // Device Flowのuser向けinstructionだけをstdoutへ出力する
-fn write_device_instructions(
-    output: &mut impl Write,
-    device: &DeviceCodeResponse,
-    styled: bool,
-) -> Result<()> {
-    crate::ui::write_operation(output, "Authorize Eiyah with GitHub", styled)?;
-    writeln!(output, "Open: {}", device.verification_uri)?;
-    writeln!(output, "Code: {}", device.user_code)?;
+fn write_device_instructions(output: &mut impl Write, device: &DeviceCodeResponse) -> Result<()> {
+    writeln!(
+        output,
+        "First copy your one-time code: {}",
+        device.user_code
+    )?;
+    writeln!(
+        output,
+        "Then open {} in your browser.",
+        device.verification_uri
+    )?;
+    writeln!(output, "Waiting for authorization...")?;
     Ok(())
 }
 
@@ -2117,7 +2202,7 @@ fn select_private_release_asset(
 }
 
 /// `$HOME`配下のed25519 key pairと`authorized_keys`を準備する
-fn bootstrap_ssh(home: &Path) -> Result<()> {
+fn bootstrap_ssh(home: &Path) -> Result<SshSetupResult> {
     let user = env::var_os("USER").filter(|value| !value.is_empty());
     bootstrap_ssh_with(home, user.as_deref(), |command| command.output())
 }
@@ -2127,7 +2212,7 @@ fn bootstrap_ssh_with(
     home: &Path,
     user: Option<&OsStr>,
     mut execute: impl FnMut(&mut Command) -> io::Result<Output>,
-) -> Result<()> {
+) -> Result<SshSetupResult> {
     let ssh_directory = home.join(".ssh");
     ensure_ssh_directory(&ssh_directory)?;
     let private_key = ssh_directory.join("id_ed25519");
@@ -2139,7 +2224,8 @@ fn bootstrap_ssh_with(
 
     let private_exists = path_exists(&private_key)?;
     let public_exists = path_exists(&public_key)?;
-    let key = match (private_exists, public_exists) {
+    let initial_state = (private_exists, public_exists);
+    let key = match initial_state {
         (true, true) => {
             let derived = derive_public_key(&private_key, &mut execute)?;
             let existing = parse_public_key(&fs::read(&public_key)?)?;
@@ -2173,7 +2259,75 @@ fn bootstrap_ssh_with(
         }
     };
 
-    update_authorized_keys(&authorized_keys, &key)
+    let authorized_added = update_authorized_keys(&authorized_keys, &key)?;
+    Ok(match (initial_state, authorized_added) {
+        ((true, true), false) => SshSetupResult::ExistingAuthorized,
+        ((true, false), authorization_added) => SshSetupResult::CreatedPublic {
+            authorization_added,
+        },
+        ((false, false), authorization_added) => SshSetupResult::Generated {
+            authorization_added,
+        },
+        ((true, true), true) => SshSetupResult::ExistingAuthorizedAdded,
+        ((false, true), _) => unreachable!(),
+    })
+}
+
+// SSH setup結果を利用者向けdetailへ変換する
+fn print_ssh_setup(home: &Path, result: SshSetupResult) -> Result<()> {
+    write_ssh_setup(&mut io::stdout().lock(), home, result)
+}
+
+// SSH setup detailを指定outputへ書き出す
+fn write_ssh_setup(output: &mut impl Write, home: &Path, result: SshSetupResult) -> Result<()> {
+    let private_key = home.join(".ssh/id_ed25519");
+    let public_key = home.join(".ssh/id_ed25519.pub");
+    let authorized_keys = home.join(".ssh/authorized_keys");
+    let existing = |output: &mut dyn Write| -> io::Result<()> {
+        writeln!(output, "Using existing SSH key: {}", private_key.display())
+    };
+    match result {
+        SshSetupResult::ExistingAuthorized => {
+            existing(output)?;
+            writeln!(output, "SSH key is already authorized.")?;
+        }
+        SshSetupResult::CreatedPublic {
+            authorization_added,
+        } => {
+            existing(output)?;
+            writeln!(output, "Created: {}", public_key.display())?;
+            write_ssh_authorization(output, &authorized_keys, authorization_added)?;
+        }
+        SshSetupResult::Generated {
+            authorization_added,
+        } => {
+            writeln!(
+                output,
+                "Generated ED25519 SSH key: {}",
+                private_key.display()
+            )?;
+            write_ssh_authorization(output, &authorized_keys, authorization_added)?;
+        }
+        SshSetupResult::ExistingAuthorizedAdded => {
+            existing(output)?;
+            writeln!(output, "Added SSH key to: {}", authorized_keys.display())?;
+        }
+    }
+    Ok(())
+}
+
+// authorizationを実際に追加したかに応じてSSH detailを表示する
+fn write_ssh_authorization(
+    output: &mut impl Write,
+    authorized_keys: &Path,
+    authorization_added: bool,
+) -> Result<()> {
+    if authorization_added {
+        writeln!(output, "Added SSH key to: {}", authorized_keys.display())?;
+    } else {
+        writeln!(output, "SSH key is already authorized.")?;
+    }
+    Ok(())
 }
 
 // `.ssh`を検証しmissing時だけ規定permissionで作成する
@@ -2324,7 +2478,7 @@ fn write_new_public_key(path: &Path, key: &SshPublicKey) -> Result<()> {
 }
 
 // authorized_keysへ同一keyがない場合だけatomic replacementで追加する
-fn update_authorized_keys(path: &Path, key: &SshPublicKey) -> Result<()> {
+fn update_authorized_keys(path: &Path, key: &SshPublicKey) -> Result<bool> {
     let existing = match fs::read(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -2335,7 +2489,7 @@ fn update_authorized_keys(path: &Path, key: &SshPublicKey) -> Result<()> {
         .filter_map(|line| parse_public_key(line).ok())
         .any(|candidate| same_public_key(&candidate, key))
     {
-        return Ok(());
+        return Ok(false);
     }
 
     let mode = match fs::symlink_metadata(path) {
@@ -2344,7 +2498,8 @@ fn update_authorized_keys(path: &Path, key: &SshPublicKey) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let temporary = authorized_keys_temporary_path(path);
-    replace_authorized_keys(path, &temporary, &existing, key, mode)
+    replace_authorized_keys(path, &temporary, &existing, key, mode)?;
+    Ok(true)
 }
 
 // 指定temporary pathを使用してauthorized_keysをatomic replacementする
@@ -2613,16 +2768,64 @@ mod tests {
         );
         let device: DeviceCodeResponse = body.read_json()?;
         let mut output = Vec::new();
-        write_device_instructions(&mut output, &device, false)?;
+        write_device_instructions(&mut output, &device)?;
         let output = String::from_utf8(output)?;
 
         assert_eq!(device.expires_in, 900);
         assert_eq!(device.interval, 5);
         assert_eq!(
             output,
-            "==> Authorize Eiyah with GitHub\nOpen: https://github.com/login/device\nCode: ABCD-1234\n"
+            "First copy your one-time code: ABCD-1234\n\
+             Then open https://github.com/login/device in your browser.\n\
+             Waiting for authorization...\n"
         );
         assert!(!output.contains(&device.device_code));
+        Ok(())
+    }
+
+    #[test]
+    // SSH setupの各状態を利用者向けdetailへ変換する
+    fn displays_ssh_setup_variants() -> Result<()> {
+        let home = Path::new("/home/tester");
+        let cases = [
+            (
+                SshSetupResult::ExistingAuthorized,
+                "Using existing SSH key: /home/tester/.ssh/id_ed25519\nSSH key is already authorized.\n",
+            ),
+            (
+                SshSetupResult::CreatedPublic {
+                    authorization_added: true,
+                },
+                "Using existing SSH key: /home/tester/.ssh/id_ed25519\nCreated: /home/tester/.ssh/id_ed25519.pub\nAdded SSH key to: /home/tester/.ssh/authorized_keys\n",
+            ),
+            (
+                SshSetupResult::CreatedPublic {
+                    authorization_added: false,
+                },
+                "Using existing SSH key: /home/tester/.ssh/id_ed25519\nCreated: /home/tester/.ssh/id_ed25519.pub\nSSH key is already authorized.\n",
+            ),
+            (
+                SshSetupResult::Generated {
+                    authorization_added: true,
+                },
+                "Generated ED25519 SSH key: /home/tester/.ssh/id_ed25519\nAdded SSH key to: /home/tester/.ssh/authorized_keys\n",
+            ),
+            (
+                SshSetupResult::Generated {
+                    authorization_added: false,
+                },
+                "Generated ED25519 SSH key: /home/tester/.ssh/id_ed25519\nSSH key is already authorized.\n",
+            ),
+            (
+                SshSetupResult::ExistingAuthorizedAdded,
+                "Using existing SSH key: /home/tester/.ssh/id_ed25519\nAdded SSH key to: /home/tester/.ssh/authorized_keys\n",
+            ),
+        ];
+        for (result, expected) in cases {
+            let mut output = Vec::new();
+            write_ssh_setup(&mut output, home, result)?;
+            assert_eq!(String::from_utf8(output)?, expected);
+        }
         Ok(())
     }
 
@@ -2776,7 +2979,7 @@ mod tests {
         fs::create_dir(&ssh)?;
         fs::write(ssh.join("id_ed25519"), b"private")?;
 
-        bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+        let result = bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
             Ok(ssh_keygen_output(
                 0,
                 b" ssh-ed25519 AAAA derived-comment \n",
@@ -2784,6 +2987,12 @@ mod tests {
             ))
         })?;
 
+        assert_eq!(
+            result,
+            SshSetupResult::CreatedPublic {
+                authorization_added: true
+            }
+        );
         assert_eq!(
             fs::read(ssh.join("id_ed25519.pub"))?,
             b"ssh-ed25519 AAAA derived-comment\n"
@@ -2805,6 +3014,40 @@ mod tests {
                 .mode()
                 & 0o777,
             AUTHORIZED_KEYS_MODE
+        );
+        Ok(())
+    }
+
+    #[test]
+    // public keyのみ作成し既存authorizationを重複追加しない
+    fn derives_public_key_without_duplicate_authorization() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = ssh_home(&directory)?;
+        let ssh = home.join(".ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(ssh.join("id_ed25519"), b"private")?;
+        fs::write(
+            ssh.join("authorized_keys"),
+            b"ssh-ed25519 AAAA existing-comment\n",
+        )?;
+
+        let result = bootstrap_ssh_with(&home, Some(OsStr::new("user")), |_| {
+            Ok(ssh_keygen_output(
+                0,
+                b"ssh-ed25519 AAAA derived-comment\n",
+                b"",
+            ))
+        })?;
+
+        assert_eq!(
+            result,
+            SshSetupResult::CreatedPublic {
+                authorization_added: false
+            }
+        );
+        assert_eq!(
+            fs::read(ssh.join("authorized_keys"))?,
+            b"ssh-ed25519 AAAA existing-comment\n"
         );
         Ok(())
     }
@@ -3630,6 +3873,111 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    // existing installのoperationをupdate前に設計どおり表示する
+    fn displays_existing_install_before_update() -> Result<()> {
+        let (result, output) = crate::ui::capture_stdout(|| {
+            route_install_state(
+                InstallState::Installed,
+                || Ok(()),
+                || unreachable!(),
+                || Ok(()),
+                || unreachable!(),
+            )
+        });
+
+        result?;
+        assert_eq!(output, "\n==> Eiyah is already installed\n");
+        Ok(())
+    }
+
+    #[test]
+    // initial installのproduction出力経路を完走してexact transcriptを検証する
+    fn displays_initial_install_transcript() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let core_root = directory.path.join("core");
+        fs::create_dir(&home)?;
+        for root in [
+            &paths.config_home,
+            &paths.data_home,
+            &paths.state_home,
+            &paths.cache_home,
+        ] {
+            fs::create_dir(root)?;
+        }
+        fs::create_dir_all(core_root.join("dotfiles/git/.config/git"))?;
+        fs::create_dir_all(core_root.join("dotfiles/tcsh"))?;
+        fs::write(core_root.join("dotfiles/tcsh/.cshrc"), b"cshrc")?;
+        let release = PrivateReleaseInfo {
+            tag_name: "v1.2.3".to_owned(),
+            archive_url: "https://example.com/configuration.tar.gz".to_owned(),
+            show_cad_status_asset_id: 101,
+            show_cad_status_checksum_asset_id: 102,
+        };
+        let mut transaction = Transaction::new();
+
+        let (result, output) = crate::ui::capture_stdout(|| {
+            install_not_installed_with(
+                &paths,
+                &home,
+                &core_root,
+                "token",
+                &release,
+                &mut transaction,
+                |paths, _| {
+                    fs::create_dir_all(paths.pixi_home.join("bin"))?;
+                    fs::create_dir_all(paths.pixi_home.join("manifests"))?;
+                    for binary in ["pixi", "stow"] {
+                        let path = paths.pixi_home.join("bin").join(binary);
+                        fs::write(&path, b"binary")?;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+                    }
+                    fs::write(
+                        paths.pixi_home.join("manifests/pixi-global.toml"),
+                        b"version = 1\n",
+                    )?;
+                    Ok(CreatedManagedRoot {
+                        path: paths.pixi_home.clone(),
+                        identity: PathIdentity::from_path(&paths.pixi_home)?,
+                    })
+                },
+                |_| Ok(()),
+                |dotfiles| {
+                    let target = dotfiles.join("git/.config/git/config.local");
+                    fs::write(&target, b"[user]\n")?;
+                    Ok(target)
+                },
+                |_, home, package| {
+                    if package == OsStr::new("tcsh") {
+                        symlink(".dotfiles/tcsh/.cshrc", home.join(".cshrc"))?;
+                    }
+                    Ok(())
+                },
+                |paths, _, _, _| {
+                    let target = paths.eiyah_prefix.join("bin/show-cad-status");
+                    fs::write(&target, b"binary")?;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+                    Ok(target)
+                },
+            )
+        });
+
+        result?;
+        let expected = format!(
+            "\n==> Installing Eiyah\n{}\n\n==> Installing Pixi\n{}\n\n==> Syncing packages\n\n==> Configuring shell and Git\n{}\nInstalling dotfiles.\nLinking configuration files.\n\n==> Installing show-cad-status\nv1.2.3\n{}\n{}\n\n==> Verifying show-cad-status download\nSHA-256: verified\n\n==> Creating Eiyah config\n{}\n\n==> Verifying installation\n\n==> Eiyah installation complete\n",
+            home.join(".local/bin/eiyah").display(),
+            paths.pixi_home.display(),
+            home.join(".dotfiles").display(),
+            private_asset_url(release.show_cad_status_asset_id),
+            home.join(".local/bin/show-cad-status").display(),
+            paths.eiyah_config.display(),
+        );
+        assert_eq!(output, expected);
         Ok(())
     }
 
