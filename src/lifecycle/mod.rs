@@ -49,7 +49,7 @@ fn require_https_url(url: &str) -> Result<()> {
 /// candidate fileのSHA-256がRelease checksumと一致することを検証する
 fn verify_checksum(path: &Path, expected: &[u8; 32]) -> Result<()> {
     let mut file = fs::File::open(path)
-        .with_context(|| format!("failed to open candidate {}", path.display()))?;
+        .with_context(|| format!("failed to open downloaded Eiyah {}", path.display()))?;
     let mut hasher = Sha256::new();
     io::copy(&mut file, &mut hasher)?;
     let calculated = hasher.finalize();

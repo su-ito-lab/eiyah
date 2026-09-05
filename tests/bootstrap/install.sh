@@ -67,6 +67,12 @@ assert_status 1 confirm_install <<<'No'
 assert_status 0 confirm_install <<<$'invalid\nY'
 assert_status 2 confirm_install </dev/null
 
+overview=$(install_overview)
+expected_overview=$(printf '%s\n' '==> Eiyah will install:' 'Eiyah' 'show-cad-status' \
+    'Pixi environment' 'Eiyah configuration' 'managed dotfiles' '' \
+    'Shell and Git settings will also be configured.')
+[[ $overview == "$expected_overview" ]] || fail 'install overview did not match the UI contract'
+
 
 # --------------------------------------------------
 # Release and Checksum
@@ -118,6 +124,7 @@ assert_status 37 run_temporary_install "$fake_eiyah"
 [[ $(<"$invocation_log") == __install ]] || fail 'temporary Eiyah invocation was not canonical'
 
 confirm_install() {
+    printf 'Install Eiyah? [Y/n] y\n'
     return 0
 }
 discover_release_tag() {
@@ -125,7 +132,7 @@ discover_release_tag() {
 }
 download_release_assets() {
     local directory=$2
-    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$1" >"%s"\nexit "${FAKE_INSTALL_STATUS}"\n' \
+    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$1" >"%s"\nprintf "\\n==> lifecycle output\\n"\nexit "${FAKE_INSTALL_STATUS}"\n' \
         "$invocation_log" >"$directory/$BINARY_ASSET"
     local generated_digest
     generated_digest=$(/usr/bin/sha256sum "$directory/$BINARY_ASSET")
@@ -145,8 +152,16 @@ FAKE_INSTALL_STATUS=0
 FAKE_CHECKSUM_VALID=1
 export FAKE_CHECKSUM_VALID FAKE_INSTALL_STATUS TMPDIR
 : >"$invocation_log"
-run_main_in_subshell
+main_output=$(run_main_in_subshell)
 [[ $(<"$invocation_log") == __install ]] || fail 'main did not invoke temporary Eiyah'
+expected_main_output=$(printf '%s\n' '==> Eiyah will install:' 'Eiyah' 'show-cad-status' \
+    'Pixi environment' 'Eiyah configuration' 'managed dotfiles' '' \
+    'Shell and Git settings will also be configured.' '' 'Install Eiyah? [Y/n] y' '' \
+    '==> Downloading Eiyah 1.2.3' \
+    "$RELEASE_DOWNLOAD_ROOT/v1.2.3/$BINARY_ASSET" '' \
+    '==> Verifying Eiyah download' 'SHA-256: verified' '' \
+    '==> lifecycle output')
+[[ $main_output == "$expected_main_output" ]] || fail 'install bootstrap output did not match the UI contract'
 if compgen -G "$TMPDIR/eiyah-bootstrap.*" >/dev/null; then
     fail 'successful bootstrap did not cleanup its temporary directory'
 fi
@@ -185,7 +200,7 @@ set -e
 /usr/bin/chmod 0755 "$TMPDIR"
 [[ $cleanup_failure_status -eq 23 ]] || fail 'cleanup failure replaced the lifecycle status'
 cleanup_failure_error=$(<"$test_root/cleanup-failure-error")
-[[ $cleanup_failure_error == *'Warning: failed to cleanup bootstrap temporary directory: '* ]] \
+[[ $cleanup_failure_error == *'Warning: failed to remove temporary files: '* ]] \
     || fail 'cleanup failure did not emit a warning'
 /usr/bin/rm --recursive --force -- "$TMPDIR"/eiyah-bootstrap.*
 

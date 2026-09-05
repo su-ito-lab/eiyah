@@ -87,6 +87,13 @@ assert_status 1 confirm_uninstall <<<'No'
 assert_status 0 confirm_uninstall <<<$'invalid\nY'
 assert_status 2 confirm_uninstall </dev/null
 
+overview=$(uninstall_overview)
+expected_overview=$(printf '%s\n' '==> Eiyah will remove:' 'Eiyah' 'show-cad-status' \
+    'Pixi environment' 'Eiyah configuration' 'managed dotfiles' '' \
+    'Previously backed up configuration will be restored when present.' \
+    'SSH keys and authorized_keys changes will be kept.')
+[[ $overview == "$expected_overview" ]] || fail 'uninstall overview did not match the UI contract'
+
 create_cleanup_fixture
 valid_plan=$test_root/valid-plan
 write_plan "$valid_plan"
@@ -211,6 +218,7 @@ assert_status 1 run_final_cleanup
 # --------------------------------------------------
 
 confirm_uninstall() {
+    printf 'Uninstall Eiyah? [y/N] y\n'
     return 0
 }
 discover_release_tag() {
@@ -218,7 +226,7 @@ discover_release_tag() {
 }
 download_release_assets() {
     local directory=$2
-    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$*" >"%s"\nprintf "eiyah-binary=%%s\\neiyah-entry=%%s\\nstate-root=%%s\\nlock=%%s\\n" "%s" "%s" "%s" "%s" >"$3"\nexit %s\n' \
+    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$*" >"%s"\nprintf "%%s\\n" "${FAKE_UNINSTALL_OUTPUT-}"\nprintf "eiyah-binary=%%s\\neiyah-entry=%%s\\nstate-root=%%s\\nlock=%%s\\n" "%s" "%s" "%s" "%s" >"$3"\nexit %s\n' \
         "$test_root/invocation" \
         "$(hex_path "$fixture_binary")" \
         "$(hex_path "$fixture_entry")" \
@@ -237,13 +245,30 @@ run_main_in_subshell() {
 create_cleanup_fixture
 export fixture_binary fixture_entry fixture_state_root fixture_lock
 FAKE_UNINSTALL_STATUS=0
-export FAKE_UNINSTALL_STATUS
+FAKE_UNINSTALL_OUTPUT=$'\n'$(printf '%s\n' \
+    '==> Unlinking configuration files' '' \
+    '==> Removing show-cad-status' "$fixture_home/.local/bin/show-cad-status" '' \
+    '==> Removing Eiyah configuration' "$test_root/config/eiyah/config.toml" \
+    "$fixture_home/.dotfiles" '' \
+    '==> Removing Pixi environment' "$test_root/data/eiyah/pixi" '' \
+    '==> Restoring previous configuration' "$fixture_home/.cshrc")
+export FAKE_UNINSTALL_OUTPUT FAKE_UNINSTALL_STATUS
 TMPDIR=$test_root/temporary
 /usr/bin/mkdir "$TMPDIR"
 export TMPDIR
-run_main_in_subshell
+main_output=$(run_main_in_subshell)
 [[ $(<"$test_root/invocation") == "__uninstall --cleanup-plan $TMPDIR/"eiyah-bootstrap.* ]] \
     || fail 'temporary Eiyah invocation was not canonical'
+expected_main_output=$(printf '%s\n' '==> Eiyah will remove:' 'Eiyah' 'show-cad-status' \
+    'Pixi environment' 'Eiyah configuration' 'managed dotfiles' '' \
+    'Previously backed up configuration will be restored when present.' \
+    'SSH keys and authorized_keys changes will be kept.' '' 'Uninstall Eiyah? [y/N] y' '' \
+    '==> Downloading Eiyah 1.2.3' \
+    "$RELEASE_DOWNLOAD_ROOT/v1.2.3/$BINARY_ASSET" '' \
+    '==> Verifying Eiyah download' 'SHA-256: verified' \
+    "$FAKE_UNINSTALL_OUTPUT" '' '==> Removing Eiyah' "$fixture_entry" '' \
+    '==> Eiyah uninstallation complete')
+[[ $main_output == "$expected_main_output" ]] || fail 'uninstall output did not match the UI contract'
 [[ ! -e $fixture_entry && ! -L $fixture_entry ]] || fail 'bootstrap did not remove public entry'
 [[ ! -e $fixture_binary ]] || fail 'bootstrap did not remove installed binary'
 [[ ! -e $fixture_state_root ]] || fail 'bootstrap did not remove state root'
@@ -260,6 +285,25 @@ assert_status 19 run_main_in_subshell
 if compgen -G "$TMPDIR/eiyah-bootstrap.*" >/dev/null; then
     fail 'failed uninstall bootstrap did not cleanup temporary content'
 fi
+
+create_cleanup_fixture
+FAKE_UNINSTALL_STATUS=0
+/usr/bin/chmod 0555 "${fixture_entry%/eiyah}"
+set +e
+run_main_in_subshell >"$test_root/final-cleanup-output" 2>"$test_root/final-cleanup-error"
+final_cleanup_status=$?
+set -e
+/usr/bin/chmod 0755 "${fixture_entry%/eiyah}"
+[[ $final_cleanup_status -eq 1 ]] || fail 'final cleanup failure did not fail uninstall'
+mapfile -t final_cleanup_diagnostics <"$test_root/final-cleanup-error"
+[[ ${#final_cleanup_diagnostics[@]} -eq 3 ]] \
+    || fail 'final cleanup failure emitted an unexpected diagnostic count'
+[[ ${final_cleanup_diagnostics[0]} == "Error: failed to remove $fixture_entry: "?* ]] \
+    || fail 'final cleanup failure did not report the path and error detail'
+[[ ${final_cleanup_diagnostics[1]} == 'Warning: Eiyah configuration has already been removed.' ]] \
+    || fail 'final cleanup failure did not report removed configuration'
+[[ ${final_cleanup_diagnostics[2]} == 'Hint: Uninstallation is incomplete.' ]] \
+    || fail 'final cleanup failure did not report incomplete uninstall'
 
 confirm_uninstall() {
     return 1
