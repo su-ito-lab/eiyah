@@ -1,0 +1,109 @@
+# ==================================================
+# @file .github/workflows/release.yaml
+# @brief Public Eiyah release workflow
+# ==================================================
+
+
+name: Eiyah release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_ASSET: eiyah-x86_64-unknown-linux-gnu
+  CHECKSUM_ASSET: eiyah-x86_64-unknown-linux-gnu.sha256
+
+jobs:
+
+
+  # --------------------------------------------------
+  # Release
+  # --------------------------------------------------
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    container: almalinux:8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: dnf install --assumeyes ca-certificates coreutils curl gcc git jq
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3230091d7ef9483f601620abacc570c22cf44d22 # 1.85.0
+      - name: Check compatibility baseline
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+      - name: Validate release version
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          stable_semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! $TAG_NAME =~ $stable_semver ]]; then
+            printf 'invalid stable release tag: %s\n' "$TAG_NAME" >&2
+            exit 1
+          fi
+          version=${TAG_NAME#v}
+          package_version=$(cargo metadata --no-deps --format-version 1 | jq --exit-status --raw-output '
+            [.packages[] | select(.name == "eiyah")]
+            | if length == 1 then .[0].version else error("expected exactly one eiyah package") end
+          ')
+          if [[ $version != "$package_version" ]]; then
+            printf 'release tag version %s does not match Cargo package version %s\n' \
+              "$version" "$package_version" >&2
+            exit 1
+          fi
+          printf 'VERSION=%s\n' "$package_version" >>"$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          install -m 0755 target/release/eiyah "$BINARY_ASSET"
+          test -f "$BINARY_ASSET"
+          test ! -L "$BINARY_ASSET"
+          test -x "$BINARY_ASSET"
+
+          # sentinelでcommand substitutionによる末尾newline除去を防ぐ
+          actual_output=$(
+            "./$BINARY_ASSET" --version
+            status=$?
+            printf '\034'
+            exit "$status"
+          )
+          expected_output=$(printf 'eiyah %s\n\034' "$VERSION")
+          test "$actual_output" = "$expected_output"
+
+          sha256sum "$BINARY_ASSET" >"$CHECKSUM_ASSET"
+          exec 3<"$CHECKSUM_ASSET"
+          IFS= read -r checksum_line <&3
+          checksum_digest=${checksum_line%%  *}
+          test "$checksum_line" = "$checksum_digest  $BINARY_ASSET"
+          [[ $checksum_digest =~ ^[0-9a-f]{64}$ ]]
+          if IFS= read -r extra_line <&3 || [[ -n $extra_line ]]; then
+            exit 1
+          fi
+          exec 3<&-
+          sha256sum --check --strict --status "$CHECKSUM_ASSET"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            eiyah-x86_64-unknown-linux-gnu
+            eiyah-x86_64-unknown-linux-gnu.sha256
