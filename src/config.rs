@@ -4,10 +4,9 @@
 // ==================================================
 
 use std::env;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -16,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::transaction::LockGuard;
+use crate::transaction::{InitialPublish, LockGuard, PathIdentity, publish_initial_file};
 
 // user設定を保存するTOML file名
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -305,12 +304,15 @@ pub fn save_install_metadata(paths: &ResolvedPaths) -> Result<()> {
 }
 
 /// 初回install用metadataを既存targetを置換せずに作成する
-pub fn create_install_metadata(paths: &ResolvedPaths) -> Result<()> {
+pub(crate) fn create_install_metadata(paths: &ResolvedPaths) -> Result<InitialPublish> {
     create_install_metadata_with(paths, |_| Ok(()))
 }
 
 // commit直前のraceをtest可能にしつつ初回install用metadataを保存する
-fn create_install_metadata_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<()>
+fn create_install_metadata_with<F>(
+    paths: &ResolvedPaths,
+    before_commit: F,
+) -> Result<InitialPublish>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
@@ -323,12 +325,12 @@ where
 }
 
 /// 初回install用configを`show-cad-status = true`で新規作成する
-pub fn create_initial_config(paths: &ResolvedPaths) -> Result<()> {
+pub(crate) fn create_initial_config(paths: &ResolvedPaths) -> Result<InitialPublish> {
     create_initial_config_with(paths, |_| Ok(()))
 }
 
 // commit直前のraceをtest可能にしてinitial configを作成する
-fn create_initial_config_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<()>
+fn create_initial_config_with<F>(paths: &ResolvedPaths, before_commit: F) -> Result<InitialPublish>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
@@ -340,7 +342,11 @@ where
 }
 
 // same-directory temporary fileからinitial targetをatomic no-replaceで作成する
-fn create_initial_file_with<F>(target: &Path, contents: &[u8], before_commit: F) -> Result<()>
+fn create_initial_file_with<F>(
+    target: &Path,
+    contents: &[u8],
+    before_commit: F,
+) -> Result<InitialPublish>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
@@ -362,7 +368,7 @@ where
         )
     })?;
 
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<InitialPublish> {
         temporary_file
             .set_permissions(fs::Permissions::from_mode(TEMP_FILE_MODE))
             .with_context(|| {
@@ -386,7 +392,15 @@ where
         validate_initial_target(&target)?;
         before_commit(&temporary_path)?;
         validate_same_inode(&temporary_path, &created_temporary)?;
-        rename_without_replace(&temporary_path, &target).with_context(|| {
+        publish_initial_file(
+            &temporary_path,
+            &target,
+            PathIdentity {
+                device: created_temporary.dev(),
+                inode: created_temporary.ino(),
+            },
+        )
+        .with_context(|| {
             format!(
                 "failed to create installation metadata: {}",
                 target.display()
@@ -447,29 +461,6 @@ fn validate_existing_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to inspect directory: {}", path.display()))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         bail!("path must be a non-symlink directory: {}", path.display());
-    }
-    Ok(())
-}
-
-// Linuxのrenameat2でfinal targetのatomic no-replaceを保証する
-fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("source path contains a NUL byte"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("destination path contains a NUL byte"))?;
-
-    // SAFETY: 両pathはNUL終端済みで、有効なpointerをcall完了まで保持する
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }

@@ -15,12 +15,13 @@ use anyhow::{Context, Result, bail};
 use crate::config::{
     ResolvedPaths, discover_install_metadata, load_install_metadata, runtime_home,
 };
-use crate::transaction::{LockGuard, PathIdentity, decode_backup_index_entry, read_backup_index};
+use crate::transaction::{
+    LockGuard, PathIdentity, decode_backup_index_entry, move_without_replace, read_backup_index,
+};
 
 use super::install::{
-    INSTALL_DIRECTORY_MODE, path_exists, rename_without_replace, stow_packages,
-    validate_absolute_entry, validate_expected_executable, validate_non_symlink_directory,
-    validate_regular_non_symlink,
+    INSTALL_DIRECTORY_MODE, path_exists, stow_packages, validate_absolute_entry,
+    validate_expected_executable, validate_non_symlink_directory, validate_regular_non_symlink,
 };
 
 // --------------------------------------------------
@@ -376,7 +377,7 @@ fn restore_backup_entry(
     if PathIdentity::from_path(source)? != identity {
         bail!("backup source identity changed: {}", source.display());
     }
-    rename_without_replace(source, destination)?;
+    move_without_replace(source, destination)?;
     Ok(())
 }
 

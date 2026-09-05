@@ -73,6 +73,13 @@ pub struct PathIdentity {
     pub inode: u64,
 }
 
+/// initial regular fileのpublish結果とbest-effort cleanup結果
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct InitialPublish {
+    /// publish後に残ったtemporary pathのcleanup error
+    pub(crate) cleanup_error: Option<String>,
+}
+
 impl PathIdentity {
     /// symlinkをfollowせず現在のpath identityを取得する
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -231,7 +238,7 @@ fn rollback_backup(from: &Path, to: &Path, index: &Path, entry: &[u8]) -> Result
         index,
         entry,
         |_| Ok(()),
-        |path, entries| write_backup_index(path, entries),
+        |path, entries| write_backup_index(path, entries).map(|_| ()),
     )
 }
 
@@ -275,7 +282,7 @@ fn rollback_backup_with(
     if PathIdentity::from_path(to)? != identity {
         bail!("backup source identity changed: {}", to.display());
     }
-    rename_without_replace(to, from)?;
+    move_without_replace(to, from)?;
     entries.retain(|candidate| candidate.as_slice() != entry);
     update_index(index, &entries)?;
     Ok(())
@@ -356,7 +363,7 @@ pub(crate) fn read_backup_index(path: &Path) -> Result<Option<Vec<Vec<u8>>>> {
 }
 
 /// backup indexへ重複しないentryをatomicに追加する
-pub(crate) fn append_backup_index_entry(path: &Path, entry: &[u8]) -> Result<()> {
+pub(crate) fn append_backup_index_entry(path: &Path, entry: &[u8]) -> Result<InitialPublish> {
     decode_backup_index_entry(entry)?;
     let mut entries = read_backup_index(path)?.unwrap_or_default();
     if entries.iter().any(|existing| existing == entry) {
@@ -367,7 +374,7 @@ pub(crate) fn append_backup_index_entry(path: &Path, entry: &[u8]) -> Result<()>
 }
 
 // backup index全体をsame-directory temporary fileからatomic置換する
-pub(crate) fn write_backup_index(path: &Path, entries: &[Vec<u8>]) -> Result<()> {
+pub(crate) fn write_backup_index(path: &Path, entries: &[Vec<u8>]) -> Result<InitialPublish> {
     write_backup_index_with(path, entries, |_| Ok(()))
 }
 
@@ -376,7 +383,7 @@ fn write_backup_index_with(
     path: &Path,
     entries: &[Vec<u8>],
     before_rename: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
+) -> Result<InitialPublish> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("backup index has no parent"))?;
@@ -393,7 +400,7 @@ fn write_backup_index_with(
         .mode(BACKUP_INDEX_MODE)
         .open(&temporary)?;
     let created = file.metadata()?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<InitialPublish> {
         file.set_permissions(fs::Permissions::from_mode(BACKUP_INDEX_MODE))?;
         for entry in entries {
             decode_backup_index_entry(entry)?;
@@ -406,19 +413,27 @@ fn write_backup_index_with(
         if current.dev() != created.dev() || current.ino() != created.ino() {
             bail!("backup index temporary file was replaced");
         }
-        match fs::symlink_metadata(path) {
+        let published = match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                     bail!("backup index must be a regular file: {}", path.display());
                 }
                 fs::rename(&temporary, path)?;
+                InitialPublish {
+                    cleanup_error: None,
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                rename_without_replace(&temporary, path)?;
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => publish_initial_file(
+                &temporary,
+                path,
+                PathIdentity {
+                    device: created.dev(),
+                    inode: created.ino(),
+                },
+            )?,
             Err(error) => return Err(error.into()),
-        }
-        Ok(())
+        };
+        Ok(published)
     })();
     if result.is_err() {
         if let Ok(current) = fs::symlink_metadata(&temporary)
@@ -454,15 +469,160 @@ fn remove_created_path(path: &Path, identity: PathIdentity, recursive: bool) -> 
 
 // move先を元pathへ戻し、既存の元pathは上書きしない
 fn restore_moved_path(from: &Path, to: &Path) -> Result<()> {
-    rename_without_replace(to, from)
+    move_without_replace(to, from)
 }
 
-// destinationの存在確認とmoveをatomicに行い上書きを拒否する
-fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("source path contains a NUL byte"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("destination path contains a NUL byte"))?;
+/// 完成済みtemporary regular fileをhard linkで上書きせずpublishする
+pub(crate) fn publish_initial_file(
+    temporary: &Path,
+    destination: &Path,
+    identity: PathIdentity,
+) -> Result<InitialPublish> {
+    publish_initial_file_with(temporary, destination, identity, |source, destination| {
+        let source = path_c_string(source, "source")?;
+        let destination = path_c_string(destination, "destination")?;
+        // SAFETY: 両pathはNUL終端済みでcall完了まで有効なpointerを保持する
+        let result = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error().into())
+        }
+    })
+}
+
+fn publish_initial_file_with(
+    temporary: &Path,
+    destination: &Path,
+    identity: PathIdentity,
+    link: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<InitialPublish> {
+    if PathIdentity::from_path(temporary)? != identity {
+        bail!("temporary file identity changed: {}", temporary.display());
+    }
+    let link_result = link(temporary, destination);
+    let destination_identity = path_identity(destination)?;
+    if destination_identity != Some(identity) {
+        let error = match destination_identity {
+            None => link_result
+                .err()
+                .unwrap_or_else(|| anyhow!("published destination is missing")),
+            Some(_) => anyhow!("published destination has a different identity"),
+        };
+        let _ = remove_if_identity(temporary, identity);
+        return Err(error);
+    }
+
+    let cleanup_error = remove_if_identity(temporary, identity)
+        .err()
+        .map(|error| error.to_string());
+    Ok(InitialPublish { cleanup_error })
+}
+
+/// destinationを上書きせずmoveし、unsupported filesystemでは通常renameへfallbackする
+pub(crate) fn move_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    move_without_replace_with(
+        source,
+        destination,
+        rename_no_replace,
+        |source, destination| fs::rename(source, destination).map_err(Into::into),
+    )
+}
+
+fn move_without_replace_with(
+    source: &Path,
+    destination: &Path,
+    rename_no_replace: impl FnOnce(&Path, &Path) -> Result<()>,
+    rename_fallback: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<()> {
+    let identity = PathIdentity::from_path(source)?;
+    ensure_missing(destination)?;
+    let primary = rename_no_replace(source, destination);
+    match move_state(source, destination, identity)? {
+        MoveState::Moved => return Ok(()),
+        MoveState::Unchanged => {}
+        MoveState::Unknown => bail!("move result has an unexpected filesystem state"),
+    }
+    let error = match primary {
+        Ok(()) => bail!("move reported success without changing filesystem state"),
+        Err(error) => error,
+    };
+    if error
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::raw_os_error)
+        != Some(libc::EINVAL)
+    {
+        return Err(error);
+    }
+
+    if PathIdentity::from_path(source)? != identity {
+        bail!("move source identity changed: {}", source.display());
+    }
+    ensure_missing(destination)?;
+    let fallback = rename_fallback(source, destination);
+    match move_state(source, destination, identity)? {
+        MoveState::Moved => Ok(()),
+        MoveState::Unchanged => Err(fallback
+            .err()
+            .unwrap_or_else(|| anyhow!("fallback rename did not move source"))),
+        MoveState::Unknown => bail!("fallback rename result has an unexpected filesystem state"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MoveState {
+    Moved,
+    Unchanged,
+    Unknown,
+}
+
+fn move_state(source: &Path, destination: &Path, identity: PathIdentity) -> Result<MoveState> {
+    let source = path_identity(source)?;
+    let destination = path_identity(destination)?;
+    Ok(match (source, destination) {
+        (None, Some(current)) if current == identity => MoveState::Moved,
+        (Some(current), None) if current == identity => MoveState::Unchanged,
+        _ => MoveState::Unknown,
+    })
+}
+
+fn ensure_missing(path: &Path) -> Result<()> {
+    if path_identity(path)?.is_some() {
+        bail!("move destination already exists: {}", path.display());
+    }
+    Ok(())
+}
+
+fn path_identity(path: &Path) -> Result<Option<PathIdentity>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_if_identity(path: &Path, identity: PathIdentity) -> Result<()> {
+    match path_identity(path)? {
+        None => Ok(()),
+        Some(current) if current == identity => fs::remove_file(path).map_err(Into::into),
+        Some(_) => bail!("temporary file identity changed: {}", path.display()),
+    }
+}
+
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    let source = path_c_string(source, "source")?;
+    let destination = path_c_string(destination, "destination")?;
 
     // SAFETY: 両pathはNUL終端済みで、有効なpointerをcall完了まで保持する
     let result = unsafe {
@@ -474,10 +634,16 @@ fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
-    if result != 0 {
-        return Err(io::Error::last_os_error().into());
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
     }
-    Ok(())
+}
+
+fn path_c_string(path: &Path, label: &str) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("{label} path contains a NUL byte"))
 }
 
 // Stow済みpackageを固定したsource / target rootから解除する
@@ -886,9 +1052,195 @@ mod tests {
         fs::write(&source, b"source")?;
         fs::write(&destination, b"destination")?;
 
-        assert!(rename_without_replace(&source, &destination).is_err());
+        assert!(move_without_replace(&source, &destination).is_err());
         assert_eq!(fs::read(&source)?, b"source");
         assert_eq!(fs::read(&destination)?, b"destination");
+        Ok(())
+    }
+
+    #[test]
+    // NFSでlink応答が曖昧でもdestination identity一致をpublish成功とする
+    fn initial_publish_accepts_ambiguous_link_success() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let temporary = directory.path.join("temporary");
+        let destination = directory.path.join("destination");
+        fs::write(&temporary, b"complete")?;
+        let identity = PathIdentity::from_path(&temporary)?;
+
+        let published = publish_initial_file_with(
+            &temporary,
+            &destination,
+            identity,
+            |source, destination| {
+                fs::hard_link(source, destination)?;
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
+            },
+        )?;
+
+        assert_eq!(published.cleanup_error, None);
+        assert_eq!(fs::read(&destination)?, b"complete");
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    #[test]
+    // initial publish collisionでexisting destinationを維持する
+    fn initial_publish_rejects_destination_collision() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let temporary = directory.path.join("temporary");
+        let destination = directory.path.join("destination");
+        fs::write(&temporary, b"ours")?;
+        fs::write(&destination, b"other")?;
+        let identity = PathIdentity::from_path(&temporary)?;
+
+        assert!(publish_initial_file(&temporary, &destination, identity).is_err());
+        assert_eq!(fs::read(&destination)?, b"other");
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    #[test]
+    // publish後のtemporary replacementを削除せずpublish成功を維持する
+    fn initial_publish_preserves_replaced_temporary_after_success() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let temporary = directory.path.join("temporary");
+        let original = directory.path.join("original");
+        let destination = directory.path.join("destination");
+        fs::write(&temporary, b"complete")?;
+        let identity = PathIdentity::from_path(&temporary)?;
+
+        let published = publish_initial_file_with(
+            &temporary,
+            &destination,
+            identity,
+            |source, destination| {
+                fs::hard_link(source, destination)?;
+                fs::rename(source, &original)?;
+                fs::write(source, b"replacement")?;
+                Ok(())
+            },
+        )?;
+
+        assert!(published.cleanup_error.is_some());
+        assert_eq!(fs::read(&destination)?, b"complete");
+        assert_eq!(fs::read(&temporary)?, b"replacement");
+        assert_eq!(fs::read(&original)?, b"complete");
+        Ok(())
+    }
+
+    #[test]
+    // RENAME_NOREPLACE非対応時に通常renameへfallbackする
+    fn move_falls_back_after_unsupported_rename() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source");
+        let destination = directory.path.join("destination");
+        fs::write(&source, b"source")?;
+
+        move_without_replace_with(
+            &source,
+            &destination,
+            |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+            |source, destination| fs::rename(source, destination).map_err(Into::into),
+        )?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"source");
+        Ok(())
+    }
+
+    #[test]
+    // 通常rename fallbackがregular file以外のpath typeもそのままmoveする
+    fn move_fallback_supports_arbitrary_path_types() -> Result<()> {
+        let directory = TestDirectory::new()?;
+
+        let source_directory = directory.path.join("source-directory");
+        let destination_directory = directory.path.join("destination-directory");
+        fs::create_dir(&source_directory)?;
+        fs::write(source_directory.join("content"), b"directory")?;
+        move_without_replace_with(
+            &source_directory,
+            &destination_directory,
+            |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+            |source, destination| fs::rename(source, destination).map_err(Into::into),
+        )?;
+        assert_eq!(
+            fs::read(destination_directory.join("content"))?,
+            b"directory"
+        );
+
+        let source_symlink = directory.path.join("source-symlink");
+        let destination_symlink = directory.path.join("destination-symlink");
+        std::os::unix::fs::symlink("target", &source_symlink)?;
+        move_without_replace_with(
+            &source_symlink,
+            &destination_symlink,
+            |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+            |source, destination| fs::rename(source, destination).map_err(Into::into),
+        )?;
+        assert_eq!(
+            fs::read_link(&destination_symlink)?,
+            PathBuf::from("target")
+        );
+        Ok(())
+    }
+
+    #[test]
+    // fallbackの曖昧なerrorをdestination identityから成功と判定する
+    fn move_accepts_ambiguous_fallback_success() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source");
+        let destination = directory.path.join("destination");
+        fs::write(&source, b"source")?;
+
+        move_without_replace_with(
+            &source,
+            &destination,
+            |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+            |source, destination| {
+                fs::rename(source, destination)?;
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
+            },
+        )?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"source");
+        Ok(())
+    }
+
+    #[test]
+    // fallback未実行と予期しないstateをfailureとして保持する
+    fn move_rejects_failed_and_unknown_fallback_states() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let source = directory.path.join("source");
+        let destination = directory.path.join("destination");
+        fs::write(&source, b"source")?;
+        assert!(
+            move_without_replace_with(
+                &source,
+                &destination,
+                |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+                |_, _| Err(io::Error::from_raw_os_error(libc::EIO).into()),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&source)?, b"source");
+        assert!(!destination.exists());
+
+        assert!(
+            move_without_replace_with(
+                &source,
+                &destination,
+                |_, _| Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+                |source, destination| {
+                    fs::rename(source, destination)?;
+                    fs::write(source, b"replacement")?;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&source)?, b"replacement");
+        assert_eq!(fs::read(&destination)?, b"source");
         Ok(())
     }
 

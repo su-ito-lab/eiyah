@@ -26,8 +26,8 @@ use crate::config::{
     load_config, load_install_metadata, resolve_paths, runtime_home,
 };
 use crate::transaction::{
-    Action, LockGuard, PathIdentity, Transaction, append_backup_index_entry,
-    encode_backup_index_entry,
+    Action, InitialPublish, LockGuard, PathIdentity, Transaction, append_backup_index_entry,
+    encode_backup_index_entry, move_without_replace,
 };
 
 use super::update::update_locked;
@@ -648,6 +648,8 @@ struct BackupMove {
     index: PathBuf,
     /// lowercase hexでencodeしたindex entry
     entry: Vec<u8>,
+    /// initial index publish後のbest-effort temporary cleanup error
+    cleanup_error: Option<String>,
 }
 
 /// 展開済みPrivate rootとdotfiles sourceのfilesystem形状を検証する
@@ -681,7 +683,7 @@ fn backup_home_path_with(
     home: &Path,
     state_home: &Path,
     source: &Path,
-    update_index: impl FnOnce(&Path, &[u8]) -> Result<()>,
+    update_index: impl FnOnce(&Path, &[u8]) -> Result<InitialPublish>,
 ) -> Result<Option<BackupMove>> {
     let relative = source
         .strip_prefix(home)
@@ -710,27 +712,63 @@ fn backup_home_path_with(
         .parent()
         .with_context(|| format!("backup target has no parent: {}", target.display()))?;
     create_backup_directories(state_home, parent)?;
-    rename_without_replace(source, &target).with_context(|| {
+    move_without_replace(source, &target).with_context(|| {
         format!(
             "failed to backup {} to {}",
             source.display(),
             target.display()
         )
     })?;
-    if let Err(index_error) = update_index(&index, &entry) {
-        return match rename_without_replace(&target, source) {
-            Ok(()) => Err(index_error),
-            Err(restore_error) => Err(anyhow::anyhow!(
-                "{index_error:#}; failed to restore unindexed backup: {restore_error:#}"
-            )),
-        };
-    }
+    let published = match update_index(&index, &entry) {
+        Ok(published) => published,
+        Err(index_error) => {
+            return match move_without_replace(&target, source) {
+                Ok(()) => Err(index_error),
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "{index_error:#}; failed to restore unindexed backup: {restore_error:#}"
+                )),
+            };
+        }
+    };
     Ok(Some(BackupMove {
         from: source.to_path_buf(),
         to: target,
         index,
         entry,
+        cleanup_error: published.cleanup_error,
     }))
+}
+
+// 成功済みbackupをfallibleなuser-facing出力より先にTransactionへ記録する
+fn record_backup(transaction: &mut Transaction, moved: BackupMove) -> Result<()> {
+    record_backup_with(transaction, moved, crate::ui::print_detail)
+}
+
+// detail出力failureをtest可能にして成功済みbackupを記録・表示する
+fn record_backup_with(
+    transaction: &mut Transaction,
+    moved: BackupMove,
+    print_detail: impl FnOnce(&str) -> io::Result<()>,
+) -> Result<()> {
+    let BackupMove {
+        from,
+        to,
+        index,
+        entry,
+        cleanup_error,
+    } = moved;
+    let detail = format!("Backed up: {}", from.display());
+    transaction.record(Action::BackedUp {
+        from,
+        to,
+        index,
+        entry,
+    });
+    print_detail(&detail)?;
+    if let Some(error) = cleanup_error {
+        crate::ui::print_warning(&format!("failed to remove temporary files: {error}"));
+    }
+    Ok(())
 }
 
 // Private environment処理に先立ち固定backup rootを作成または検証する
@@ -764,28 +802,6 @@ fn create_backup_directories(state_home: &Path, path: &Path) -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         }
-    }
-    Ok(())
-}
-
-// Linuxのrenameat2でbackup targetのatomic no-replaceを保証する
-pub(super) fn rename_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("source path contains a NUL byte"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("destination path contains a NUL byte"))?;
-    // SAFETY: 両pathはNUL終端済みでcall完了まで有効なpointerを保持する
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
@@ -1830,8 +1846,11 @@ where
     record_created(transaction, paths.eiyah_prefix.join("bin/eiyah"), false)?;
     let entry = create_eiyah_public_entry(paths, home)?;
     record_created(transaction, entry, false)?;
-    create_install_metadata(paths)?;
+    let metadata_publish = create_install_metadata(paths)?;
     record_created(transaction, paths.eiyah_prefix.join("install.toml"), false)?;
+    if let Some(error) = metadata_publish.cleanup_error {
+        crate::ui::print_warning(&format!("failed to remove temporary files: {error}"));
+    }
 
     crate::ui::print_operation("Installing Pixi")?;
     crate::ui::print_detail(&paths.pixi_home.display().to_string())?;
@@ -1850,13 +1869,7 @@ where
     prepare_backup_root(&paths.state_home)?;
     let dotfiles = home.join(".dotfiles");
     if let Some(moved) = backup_home_path(home, &paths.state_home, &dotfiles)? {
-        crate::ui::print_detail(&format!("Backed up: {}", moved.from.display()))?;
-        transaction.record(Action::BackedUp {
-            from: moved.from,
-            to: moved.to,
-            index: moved.index,
-            entry: moved.entry,
-        });
+        record_backup(transaction, moved)?;
     }
     let dotfiles = install_dotfiles(core_root, home)?;
     crate::ui::print_detail("Installing dotfiles.")?;
@@ -1865,13 +1878,7 @@ where
     let packages = stow_packages(paths, &dotfiles)?;
     for conflict in stow_conflicts(&dotfiles, home, &packages)? {
         if let Some(moved) = backup_home_path(home, &paths.state_home, &conflict)? {
-            crate::ui::print_detail(&format!("Backed up: {}", moved.from.display()))?;
-            transaction.record(Action::BackedUp {
-                from: moved.from,
-                to: moved.to,
-                index: moved.index,
-                entry: moved.entry,
-            });
+            record_backup(transaction, moved)?;
         }
     }
     let stow = paths.pixi_home.join("bin/stow");
@@ -1915,8 +1922,11 @@ where
     }
     crate::ui::print_operation("Creating Eiyah config")?;
     crate::ui::print_detail(&paths.eiyah_config.display().to_string())?;
-    create_initial_config(paths)?;
+    let config_publish = create_initial_config(paths)?;
     record_created(transaction, paths.eiyah_config.clone(), false)?;
+    if let Some(error) = config_publish.cleanup_error {
+        crate::ui::print_warning(&format!("failed to remove temporary files: {error}"));
+    }
     crate::ui::print_operation("Verifying installation")?;
     validate_installation(paths, home)?;
     crate::ui::print_operation("Eiyah installation complete")?;
@@ -4480,6 +4490,43 @@ mod tests {
         assert_eq!(fs::read(&source)?, b"second");
         assert_eq!(fs::read(&moved.to)?, b"original");
         assert!(backup_home_path(&home, &state, &directory.path.join("outside")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    // backup後のdetail出力failureでも記録済みActionがHOMEとindexをrollbackする
+    fn rolls_back_backup_after_detail_output_failure() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let state = directory.path.join("state");
+        fs::create_dir(&home)?;
+        fs::create_dir(&state)?;
+        let source = home.join(".cshrc");
+        let target = state.join("eiyah/backup/home/.cshrc");
+        let index = state.join("eiyah/backup/index");
+        fs::write(&source, b"original")?;
+        let mut transaction = Transaction::new();
+
+        let error = complete_install_transaction(
+            &mut transaction,
+            |transaction| {
+                let moved = backup_home_path(&home, &state, &source)?.unwrap();
+                record_backup_with(transaction, moved, |_| {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "output failed"))
+                })
+            },
+            || Ok(()),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").starts_with("output failed"));
+        assert_eq!(fs::read(&source)?, b"original");
+        assert!(!target.exists());
+        assert_eq!(
+            crate::transaction::read_backup_index(&index)?,
+            Some(Vec::new())
+        );
         Ok(())
     }
 
