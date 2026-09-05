@@ -226,7 +226,7 @@ discover_release_tag() {
 }
 download_release_assets() {
     local directory=$2
-    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$*" >"%s"\nprintf "%%s" "${FAKE_UNINSTALL_OUTPUT-}"\nprintf "eiyah-binary=%%s\\neiyah-entry=%%s\\nstate-root=%%s\\nlock=%%s\\n" "%s" "%s" "%s" "%s" >"$3"\nexit %s\n' \
+    printf '#!/usr/bin/bash\nprintf "%%s\\n" "$*" >"%s"\nprintf "%%s\\n" "${FAKE_UNINSTALL_OUTPUT-}"\nprintf "eiyah-binary=%%s\\neiyah-entry=%%s\\nstate-root=%%s\\nlock=%%s\\n" "%s" "%s" "%s" "%s" >"$3"\nexit %s\n' \
         "$test_root/invocation" \
         "$(hex_path "$fixture_binary")" \
         "$(hex_path "$fixture_entry")" \
@@ -265,7 +265,7 @@ expected_main_output=$(printf '%s\n' '==> Eiyah will remove:' 'Eiyah' 'show-cad-
     'SSH keys and authorized_keys changes will be kept.' '' 'Uninstall Eiyah? [y/N] y' '' \
     '==> Downloading Eiyah 1.2.3' \
     "$RELEASE_DOWNLOAD_ROOT/v1.2.3/$BINARY_ASSET" '' \
-    '==> Verifying Eiyah download' 'SHA-256: verified' '' \
+    '==> Verifying Eiyah download' 'SHA-256: verified' \
     "$FAKE_UNINSTALL_OUTPUT" '' '==> Removing Eiyah' "$fixture_entry" '' \
     '==> Eiyah uninstall complete')
 [[ $main_output == "$expected_main_output" ]] || fail 'uninstall output did not match the UI contract'
@@ -285,6 +285,25 @@ assert_status 19 run_main_in_subshell
 if compgen -G "$TMPDIR/eiyah-bootstrap.*" >/dev/null; then
     fail 'failed uninstall bootstrap did not cleanup temporary content'
 fi
+
+create_cleanup_fixture
+FAKE_UNINSTALL_STATUS=0
+/usr/bin/chmod 0555 "${fixture_entry%/eiyah}"
+set +e
+run_main_in_subshell >"$test_root/final-cleanup-output" 2>"$test_root/final-cleanup-error"
+final_cleanup_status=$?
+set -e
+/usr/bin/chmod 0755 "${fixture_entry%/eiyah}"
+[[ $final_cleanup_status -eq 1 ]] || fail 'final cleanup failure did not fail uninstall'
+mapfile -t final_cleanup_diagnostics <"$test_root/final-cleanup-error"
+[[ ${#final_cleanup_diagnostics[@]} -eq 3 ]] \
+    || fail 'final cleanup failure emitted an unexpected diagnostic count'
+[[ ${final_cleanup_diagnostics[0]} == "Error: failed to remove $fixture_entry: "?* ]] \
+    || fail 'final cleanup failure did not report the path and error detail'
+[[ ${final_cleanup_diagnostics[1]} == 'Warning: Eiyah configuration has already been removed.' ]] \
+    || fail 'final cleanup failure did not report removed configuration'
+[[ ${final_cleanup_diagnostics[2]} == 'Hint: Uninstallation is incomplete.' ]] \
+    || fail 'final cleanup failure did not report incomplete uninstall'
 
 confirm_uninstall() {
     return 1

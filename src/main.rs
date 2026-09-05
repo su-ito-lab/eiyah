@@ -26,7 +26,7 @@ use config::{collect_system_config, print_config, runtime_home, set_show_cad_sta
 use doctor::run_doctor;
 use handoff::{run_handoff, run_show_cad_status_enabled};
 use lifecycle::{run_install, run_uninstall, run_update};
-use ui::print_error;
+use ui::{print_error, print_error_report};
 
 // 実装済みのPublic / Internal CLI
 #[derive(Debug, Parser)]
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            print_error(&format!("{error:#}"));
+            print_error_report(&error);
             ExitCode::from(1)
         }
     }

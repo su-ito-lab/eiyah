@@ -108,6 +108,13 @@ enum SshSetupResult {
     ExistingAuthorizedAdded,
 }
 
+impl SshSetupResult {
+    // install失敗後にも残るfilesystem変更の有無を返す
+    fn changed(self) -> bool {
+        !matches!(self, Self::ExistingAuthorized)
+    }
+}
+
 // --------------------------------------------------
 // Eiyah Installation Paths
 // --------------------------------------------------
@@ -238,7 +245,7 @@ where
     validate_source_binary(source)?;
     let target = paths.eiyah_prefix.join("bin/eiyah");
     let mut source_file = File::open(source)
-        .with_context(|| format!("failed to open source Eiyah binary: {}", source.display()))?;
+        .with_context(|| format!("failed to open Eiyah binary: {}", source.display()))?;
     let mut target_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -288,23 +295,13 @@ fn same_inode(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 // sourceがsymlinkでない実行可能なregular fileであることを保証する
 fn validate_source_binary(source: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source).with_context(|| {
-        format!(
-            "failed to inspect source Eiyah binary: {}",
-            source.display()
-        )
-    })?;
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect Eiyah binary: {}", source.display()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!(
-            "source Eiyah binary must be a regular file: {}",
-            source.display()
-        );
+        bail!("Eiyah binary must be a regular file: {}", source.display());
     }
     if metadata.permissions().mode() & 0o111 == 0 {
-        bail!(
-            "source Eiyah binary must be executable: {}",
-            source.display()
-        );
+        bail!("Eiyah binary must be executable: {}", source.display());
     }
     Ok(())
 }
@@ -313,7 +310,10 @@ fn validate_source_binary(source: &Path) -> Result<()> {
 fn create_eiyah_public_entry(paths: &ResolvedPaths, home: &Path) -> Result<PathBuf> {
     let target = paths.eiyah_prefix.join("bin/eiyah");
     if !target.is_absolute() {
-        bail!("public entry target must be absolute: {}", target.display());
+        bail!(
+            "Eiyah command link target must be absolute: {}",
+            target.display()
+        );
     }
     let public_entry = home.join(".local/bin/eiyah");
     symlink(&target, &public_entry).with_context(|| {
@@ -652,9 +652,9 @@ struct BackupMove {
 
 /// 展開済みPrivate rootとdotfiles sourceのfilesystem形状を検証する
 fn validate_private_source(core_root: &Path) -> Result<PathBuf> {
-    validate_non_symlink_directory(core_root, "Private root")?;
+    validate_non_symlink_directory(core_root, "configuration")?;
     let dotfiles = core_root.join("dotfiles");
-    validate_non_symlink_directory(&dotfiles, "Private dotfiles")?;
+    validate_non_symlink_directory(&dotfiles, "dotfiles")?;
     Ok(dotfiles)
 }
 
@@ -1531,9 +1531,9 @@ fn extract_private_archive(archive: &Path, core_root: &Path) -> Result<()> {
         .stderr(Stdio::inherit())
         .status()?;
     if !status.success() {
-        bail!("Private archive extraction failed: {status}");
+        bail!("configuration extraction failed: {status}");
     }
-    validate_non_symlink_directory(core_root, "Private archive root")
+    validate_non_symlink_directory(core_root, "extracted configuration")
 }
 
 // tar listingのentry type・single top-level・path traversalを検証する
@@ -1544,7 +1544,7 @@ fn inspect_archive(path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
-        bail!("Private archive inspection failed: {}", output.status);
+        bail!("configuration archive inspection failed: {}", output.status);
     }
     let listing = std::str::from_utf8(&output.stdout)?;
     let mut top_level: Option<OsString> = None;
@@ -1555,16 +1555,16 @@ fn inspect_archive(path: &Path) -> Result<()> {
             .copied()
             .context("empty archive listing entry")?;
         if kind != b'-' && kind != b'd' {
-            bail!("unsupported Private archive entry");
+            bail!("unsupported configuration archive entry");
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 6 {
-            bail!("invalid Private archive listing entry");
+            bail!("invalid configuration archive listing entry");
         }
         validate_archive_entry(Path::new(&fields[5..].join(" ")), &mut top_level)?;
     }
     if top_level.is_none() {
-        bail!("Private archive is empty");
+        bail!("configuration archive is empty");
     }
     Ok(())
 }
@@ -1572,11 +1572,11 @@ fn inspect_archive(path: &Path) -> Result<()> {
 // archive entryが単一top-level配下から脱出しないことを確認する
 fn validate_archive_entry(path: &Path, top_level: &mut Option<OsString>) -> Result<()> {
     if path.as_os_str().is_empty() || path.is_absolute() {
-        bail!("invalid Private archive path");
+        bail!("invalid configuration archive path");
     }
     let mut components = path.components();
     let Some(Component::Normal(first)) = components.next() else {
-        bail!("invalid Private archive path");
+        bail!("invalid configuration archive path");
     };
     if components.any(|component| {
         matches!(
@@ -1584,11 +1584,11 @@ fn validate_archive_entry(path: &Path, top_level: &mut Option<OsString>) -> Resu
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        bail!("Private archive path escapes top-level directory");
+        bail!("configuration archive path escapes its top-level directory");
     }
     match top_level {
         Some(expected) if expected != first => {
-            bail!("Private archive has multiple top-level directories")
+            bail!("configuration archive has multiple top-level directories")
         }
         None => *top_level = Some(first.to_os_string()),
         _ => {}
@@ -1627,12 +1627,36 @@ fn resolve_install_paths_with(
         return resolve_initial();
     }
 
-    let metadata_path = discover_install_metadata(&public_entry)
-        .context("Eiyah installation is partial: failed to discover install metadata")?;
-    let metadata = load_install_metadata(&metadata_path)
-        .context("Eiyah installation is partial: failed to load install metadata")?;
-    ResolvedPaths::from_install_metadata(metadata)
-        .context("Eiyah installation is partial: invalid install metadata paths")
+    let metadata_path = discover_install_metadata(&public_entry).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "existing Eiyah installation is incomplete: Eiyah command link is missing or invalid: {}",
+                public_entry.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    let metadata = load_install_metadata(&metadata_path).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "existing Eiyah installation is incomplete: installation information is missing or invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    ResolvedPaths::from_install_metadata(metadata).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "existing Eiyah installation is incomplete: installation paths are invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })
 }
 
 // install状態をlock境界の契約どおりupdateまたはinitial installへ振り分ける
@@ -1644,7 +1668,12 @@ fn route_install_state<Lock>(
     install: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if initial_state == InstallState::Partial {
-        bail!("Eiyah installation is partial");
+        return Err(crate::ui::UserFacingError::new(
+            "existing Eiyah installation is incomplete: required files are missing or invalid",
+            Vec::new(),
+            Vec::new(),
+        )
+        .into());
     }
     let _lock = acquire_lock()?;
     if initial_state == InstallState::Installed {
@@ -1656,7 +1685,12 @@ fn route_install_state<Lock>(
             crate::ui::print_operation("Eiyah is already installed")?;
             update()
         }
-        InstallState::Partial => bail!("Eiyah installation is partial"),
+        InstallState::Partial => Err(crate::ui::UserFacingError::new(
+            "existing Eiyah installation is incomplete: required files are missing or invalid",
+            Vec::new(),
+            Vec::new(),
+        )
+        .into()),
         InstallState::NotInstalled => install(),
     }
 }
@@ -1674,7 +1708,7 @@ fn install_not_installed_flow(paths: &ResolvedPaths, home: &Path) -> Result<()> 
     let ssh = bootstrap_ssh(home)?;
     print_ssh_setup(home, ssh)?;
     let mut transaction = Transaction::new();
-    complete_install_transaction(
+    let result = complete_install_transaction(
         &mut transaction,
         |transaction| {
             install_not_installed(
@@ -1688,7 +1722,20 @@ fn install_not_installed_flow(paths: &ResolvedPaths, home: &Path) -> Result<()> 
         },
         || archive.cleanup(),
         crate::ui::print_warning,
-    )
+    );
+    add_ssh_residual_warning(result, ssh)
+}
+
+// SSH変更後のinstall failureへ非transaction stateを明示する
+fn add_ssh_residual_warning(result: Result<()>, ssh: SshSetupResult) -> Result<()> {
+    match result {
+        Err(error) if ssh.changed() => Err(crate::ui::UserFacingError::with_warning(
+            error,
+            "SSH changes made during setup were not reverted.",
+        )
+        .into()),
+        result => result,
+    }
 }
 
 // install結果に応じてcommitまたはrollbackしarchive cleanupを最後に実行する
@@ -1703,23 +1750,22 @@ fn complete_install_transaction(
         Ok(()) => {
             transaction.commit();
             if let Err(error) = cleanup() {
-                warn(&format!(
-                    "failed to cleanup installation temporary files: {error:#}"
-                ));
+                warn(&format!("failed to remove temporary files: {error:#}"));
             }
             Ok(())
         }
         Err(error) => {
             let rollback = transaction.rollback();
             let cleanup = cleanup();
-            let mut message = format!("{error:#}");
-            if let Err(rollback) = rollback {
-                message.push_str(&format!("; rollback failed: {rollback:#}"));
+            let mut warnings = Vec::new();
+            if rollback.is_err() {
+                warnings
+                    .push("Eiyah could not fully restore the previous system state.".to_owned());
             }
             if let Err(cleanup) = cleanup {
-                message.push_str(&format!("; temporary cleanup failed: {cleanup:#}"));
+                warnings.push(format!("failed to remove temporary files: {cleanup:#}"));
             }
-            bail!(message)
+            Err(crate::ui::UserFacingError::new(format!("{error:#}"), warnings, Vec::new()).into())
         }
     }
 }
@@ -1895,9 +1941,37 @@ fn validate_installation(paths: &ResolvedPaths, home: &Path) -> Result<()> {
         &home.join(".local/bin/eiyah"),
         &paths.eiyah_prefix.join("bin/eiyah"),
     )?;
-    let metadata = load_install_metadata(&paths.eiyah_prefix.join("install.toml"))?;
-    if ResolvedPaths::from_install_metadata(metadata)? != *paths {
-        bail!("install metadata paths do not match initial paths");
+    let metadata_path = paths.eiyah_prefix.join("install.toml");
+    let metadata = load_install_metadata(&metadata_path).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation information is missing or invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    if ResolvedPaths::from_install_metadata(metadata).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation paths are invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })? != *paths
+    {
+        return Err(crate::ui::UserFacingError::new(
+            format!(
+                "installation paths do not match installed files: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        )
+        .into());
     }
     validate_expected_executable(&paths.pixi_home.join("bin/pixi"), "Pixi")?;
     validate_regular_non_symlink(
@@ -1927,7 +2001,7 @@ pub(super) fn validate_absolute_entry(entry: &Path, expected: &Path) -> Result<(
         || fs::read_link(entry)? != expected
         || !expected.is_absolute()
     {
-        bail!("invalid installed entry: {}", entry.display());
+        bail!("invalid Eiyah command link: {}", entry.display());
     }
     Ok(())
 }
@@ -2028,7 +2102,7 @@ fn fetch_private_release(access_token: &str) -> Result<PrivateReleaseInfo> {
     let agent = http_agent();
     let mut response = private_request(&agent, &url, access_token)
         .call()
-        .context("failed to fetch latest Private Release")?;
+        .context("failed to fetch latest configuration release")?;
     let release = parse_private_release_response(response.body_mut())?;
     private_release_info(release)
 }
@@ -2036,7 +2110,7 @@ fn fetch_private_release(access_token: &str) -> Result<PrivateReleaseInfo> {
 // Private Release responseから取得に必要なfieldだけをdecodeする
 fn parse_private_release_response(body: &mut ureq::Body) -> Result<PrivateReleaseResponse> {
     body.read_json()
-        .context("failed to parse latest Private Release response")
+        .context("failed to parse latest configuration release response")
 }
 
 // Device Flowのuser向けinstructionだけをstdoutへ出力する
@@ -2159,13 +2233,13 @@ fn private_request<'a>(
 // stable Releaseとrequired assetからPrivate取得情報を組み立てる
 fn private_release_info(release: PrivateReleaseResponse) -> Result<PrivateReleaseInfo> {
     if release.draft {
-        bail!("latest Private Release is a draft");
+        bail!("latest configuration release is a draft");
     }
     if release.prerelease {
-        bail!("latest Private Release is a prerelease");
+        bail!("latest configuration release is a prerelease");
     }
     if release.tag_name.is_empty() {
-        bail!("latest Private Release tag is empty");
+        bail!("latest configuration release tag is empty");
     }
     let show_cad_status_asset_id =
         select_private_release_asset(&release.assets, SHOW_CAD_STATUS_ASSET_NAME)?;
@@ -2193,10 +2267,10 @@ fn select_private_release_asset(
         .filter(|asset| asset.name == expected_name)
         .map(|asset| asset.id);
     let id = matches.next().ok_or_else(|| {
-        anyhow::anyhow!("required Private Release asset is missing: {expected_name}")
+        anyhow::anyhow!("required configuration file is missing: {expected_name}")
     })?;
     if matches.next().is_some() {
-        bail!("required Private Release asset is duplicated: {expected_name}");
+        bail!("required configuration file is duplicated: {expected_name}");
     }
     Ok(id)
 }
@@ -2275,7 +2349,16 @@ fn bootstrap_ssh_with(
 
 // SSH setup結果を利用者向けdetailへ変換する
 fn print_ssh_setup(home: &Path, result: SshSetupResult) -> Result<()> {
-    write_ssh_setup(&mut io::stdout().lock(), home, result)
+    write_ssh_setup_with_residual_warning(&mut io::stdout().lock(), home, result)
+}
+
+// SSH変更後の表示failureへ残存Warningを付加する
+fn write_ssh_setup_with_residual_warning(
+    output: &mut impl Write,
+    home: &Path,
+    result: SshSetupResult,
+) -> Result<()> {
+    add_ssh_residual_warning(write_ssh_setup(output, home, result), result)
 }
 
 // SSH setup detailを指定outputへ書き出す
@@ -2826,6 +2909,38 @@ mod tests {
             write_ssh_setup(&mut output, home, result)?;
             assert_eq!(String::from_utf8(output)?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    // SSH変更後のdetail出力failureへ残存Warningを付加する
+    fn reports_ssh_residual_state_after_output_failure() -> Result<()> {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "output failed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_ssh_setup_with_residual_warning(
+            &mut FailingWriter,
+            Path::new("/home/tester"),
+            SshSetupResult::Generated {
+                authorization_added: true,
+            },
+        )
+        .unwrap_err();
+        let mut output = Vec::new();
+        crate::ui::write_error_report(&mut output, &error, false)?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            "Error: output failed\nWarning: SSH changes made during setup were not reverted.\n"
+        );
         Ok(())
     }
 
@@ -4054,7 +4169,7 @@ mod tests {
         .unwrap_err();
 
         assert!(!resolver_called.get());
-        assert!(format!("{error:#}").starts_with("Eiyah installation is partial:"));
+        assert!(format!("{error:#}").starts_with("existing Eiyah installation is incomplete:"));
         Ok(())
     }
 
@@ -4202,7 +4317,51 @@ mod tests {
             |message| *warning.borrow_mut() = message.to_owned(),
         )?;
         assert!(committed.exists());
-        assert!(warning.borrow().contains("archive cleanup failed"));
+        assert_eq!(
+            *warning.borrow(),
+            "failed to remove temporary files: archive cleanup failed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    // SSH残存変更とrollback failureをprimary Error後のWarningとして表示する
+    fn reports_install_residual_state() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let replaced = directory.path.join("replaced");
+        fs::write(&replaced, b"owned")?;
+        let identity = PathIdentity::from_path(&replaced)?;
+        let mut transaction = Transaction::new();
+        transaction.record(Action::Created {
+            path: replaced.clone(),
+            identity,
+            recursive: false,
+        });
+        fs::rename(&replaced, directory.path.join("original"))?;
+        fs::write(&replaced, b"replacement")?;
+
+        let error = complete_install_transaction(
+            &mut transaction,
+            |_| bail!("installation failed"),
+            || Ok(()),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        let error = add_ssh_residual_warning(
+            Err(error),
+            SshSetupResult::Generated {
+                authorization_added: true,
+            },
+        )
+        .unwrap_err();
+        let mut output = Vec::new();
+        crate::ui::write_error_report(&mut output, &error, false)?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            "Error: installation failed\n\
+             Warning: Eiyah could not fully restore the previous system state.\n\
+             Warning: SSH changes made during setup were not reverted.\n"
+        );
         Ok(())
     }
 

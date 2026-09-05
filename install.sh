@@ -29,12 +29,27 @@ operation_started=false
 
 # bootstrap errorをstderrへ表示する
 error() {
-    printf 'Error: %s\n' "$1" >&2
+    diagnostic Error 91 "$1"
 }
 
 # primary resultを変えずtemporary cleanup failureを表示する
 warning() {
-    printf 'Warning: %s\n' "$1" >&2
+    diagnostic Warning 93 "$1"
+}
+
+# 利用者が確認すべき次状態をstderrへ表示する
+hint() {
+    diagnostic Hint 96 "$1"
+}
+
+# diagnostic labelだけをTTY条件に従ってstyleする
+diagnostic() {
+    local label=$1 color=$2 message=$3
+    if [[ -t 2 && ! -v NO_COLOR ]]; then
+        printf '\033[1;%sm%s\033[0m: %s\n' "$color" "$label" "$message" >&2
+    else
+        printf '%s: %s\n' "$label" "$message" >&2
+    fi
 }
 
 # lifecycle operation headingを表示する
@@ -149,7 +164,7 @@ release_tag_from_url() {
     local tag=${effective_url#"$prefix"}
     local semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
     if [[ $tag == "$effective_url" || ! $tag =~ $semver ]]; then
-        error "latest Public Release URL has an invalid tag: $effective_url"
+        error "latest Eiyah release URL has an invalid tag: $effective_url"
         return 1
     fi
     printf '%s\n' "$tag"
@@ -159,7 +174,7 @@ release_tag_from_url() {
 discover_release_tag() {
     local effective_url
     if ! effective_url=$(latest_release_effective_url); then
-        error 'failed to discover latest Public Release'
+        error 'failed to discover latest Eiyah release'
         return 1
     fi
     release_tag_from_url "$effective_url"
@@ -235,7 +250,7 @@ run_temporary_install() {
 cleanup_temporary() {
     if [[ -n $attempt_directory && ( -e $attempt_directory || -L $attempt_directory ) ]]; then
         if ! "$RM" --recursive --force -- "$attempt_directory"; then
-            warning "failed to cleanup bootstrap temporary directory: $attempt_directory"
+            warning "failed to remove temporary files: $attempt_directory"
         fi
     fi
     return 0
@@ -269,7 +284,7 @@ main() {
     operation "Downloading Eiyah ${tag#v}"
     printf '%s/%s/%s\n' "$RELEASE_DOWNLOAD_ROOT" "$tag" "$BINARY_ASSET"
     download_release_assets "$tag" "$attempt_directory" || {
-        error 'failed to download Public Release assets'
+        error 'failed to download Eiyah release files'
         return 1
     }
     operation 'Verifying Eiyah download'

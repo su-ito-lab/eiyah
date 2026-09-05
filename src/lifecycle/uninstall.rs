@@ -155,12 +155,12 @@ fn remove_managed_path_with(
         }
         ManagedRemovalKind::RegularFile => {
             if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                bail!("managed path must be a regular file: {}", path.display());
+                bail!("Eiyah file must be a regular file: {}", path.display());
             }
         }
         ManagedRemovalKind::Directory => {
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                bail!("managed path must be a directory: {}", path.display());
+                bail!("Eiyah path must be a directory: {}", path.display());
             }
         }
     }
@@ -171,7 +171,7 @@ fn remove_managed_path_with(
     };
     before_recheck(path)?;
     if PathIdentity::from_path(path)? != identity {
-        bail!("managed path identity changed: {}", path.display());
+        bail!("Eiyah path changed during uninstall: {}", path.display());
     }
     match kind {
         ManagedRemovalKind::Directory => fs::remove_dir_all(path)?,
@@ -208,16 +208,35 @@ fn restore_home_backups_with(
     let backup_directory = paths.state_home.join("eiyah/backup");
     let backup_root = backup_directory.join("home");
     let index = backup_directory.join("index");
-    let Some(entries) = read_backup_index(&index)? else {
+    let Some(entries) = read_backup_index(&index).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "saved configuration information is missing or invalid: {}",
+                index.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?
+    else {
         return Ok(());
     };
-    let plan = backup_restore_plan(&entries)?;
+    let plan = backup_restore_plan(&entries).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "saved configuration information is invalid: {}",
+                index.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
     if !plan.is_empty() {
-        validate_non_symlink_directory(&backup_root, "backup root")?;
+        validate_non_symlink_directory(&backup_root, "saved configuration directory")?;
         crate::ui::print_operation("Restoring previous configuration")?;
     }
 
-    for restore in &plan {
+    for (index, restore) in plan.iter().enumerate() {
         let source = backup_root.join(&restore.relative);
         let destination = home.join(&restore.relative);
         if !destination.starts_with(home) {
@@ -235,16 +254,39 @@ fn restore_home_backups_with(
             })
         })();
         if let Err(error) = result {
-            bail!(
-                "failed to restore {}: {error:#}",
-                restore.relative.as_os_str().to_string_lossy()
-            );
+            let warnings = if index == 0 {
+                Vec::new()
+            } else {
+                vec!["Some previous configuration has already been restored.".to_owned()]
+            };
+            return Err(crate::ui::UserFacingError::new(
+                format!(
+                    "failed to restore {}: {error:#}",
+                    restore.relative.as_os_str().to_string_lossy()
+                ),
+                warnings,
+                vec!["Uninstallation is incomplete.".to_owned()],
+            )
+            .into());
         }
         crate::ui::print_detail(&destination.display().to_string())?;
     }
 
-    remove_backup_index_with(&index, before_index_remove)?;
-    cleanup_backup_scaffold(&backup_root)?;
+    if let Err(error) = remove_backup_index_with(&index, before_index_remove)
+        .and_then(|()| cleanup_backup_scaffold(&backup_root))
+    {
+        let warnings = if plan.is_empty() {
+            Vec::new()
+        } else {
+            vec!["Some previous configuration has already been restored.".to_owned()]
+        };
+        return Err(crate::ui::UserFacingError::new(
+            format!("failed to finish restoring previous configuration: {error}"),
+            warnings,
+            vec!["Uninstallation is incomplete.".to_owned()],
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -257,7 +299,7 @@ fn backup_restore_plan(entries: &[Vec<u8>]) -> Result<Vec<BackupRestoreEntry>> {
             .iter()
             .any(|existing: &BackupRestoreEntry| existing.relative == relative)
         {
-            bail!("backup index contains a duplicate path");
+            bail!("saved configuration information contains a duplicate path");
         }
         plan.push(BackupRestoreEntry { relative });
     }
@@ -267,7 +309,7 @@ fn backup_restore_plan(entries: &[Vec<u8>]) -> Result<Vec<BackupRestoreEntry>> {
                 && entry.relative != other.relative
                 && entry.relative.starts_with(&other.relative)
         }) {
-            bail!("backup index contains ancestor and descendant paths");
+            bail!("saved configuration information contains overlapping paths");
         }
     }
     plan.sort_by(|left, right| {
@@ -390,7 +432,10 @@ fn remove_backup_index_with(
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(index)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!("backup index must be a regular file: {}", index.display());
+        bail!(
+            "saved configuration information must be a regular file: {}",
+            index.display()
+        );
     }
     let identity = PathIdentity {
         device: metadata.dev(),
@@ -398,7 +443,10 @@ fn remove_backup_index_with(
     };
     before_remove(index)?;
     if PathIdentity::from_path(index)? != identity {
-        bail!("backup index identity changed: {}", index.display());
+        bail!(
+            "saved configuration information changed during uninstall: {}",
+            index.display()
+        );
     }
     fs::remove_file(index)?;
     Ok(())
@@ -412,7 +460,10 @@ fn cleanup_backup_scaffold(root: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        bail!("backup scaffold must be a directory: {}", root.display());
+        bail!(
+            "saved configuration path must be a directory: {}",
+            root.display()
+        );
     }
     cleanup_backup_directory(root)?;
     Ok(())
@@ -426,7 +477,10 @@ fn cleanup_backup_directory(directory: &Path) -> Result<bool> {
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            bail!("backup scaffold contains a symlink: {}", path.display());
+            bail!(
+                "saved configuration path contains a symlink: {}",
+                path.display()
+            );
         }
         if metadata.file_type().is_dir() {
             if !cleanup_backup_directory(&path)? {
@@ -463,9 +517,37 @@ fn run_uninstall_from_home(home: &Path, cleanup_plan: &Path) -> Result<()> {
 
 // public entryからinstalled metadataを読みuninstall対象pathを復元する
 fn load_uninstall_paths(home: &Path) -> Result<ResolvedPaths> {
-    let metadata_path = discover_install_metadata(&home.join(".local/bin/eiyah"))?;
-    let metadata = load_install_metadata(&metadata_path)?;
-    ResolvedPaths::from_install_metadata(metadata)
+    let entry = home.join(".local/bin/eiyah");
+    let metadata_path = discover_install_metadata(&entry).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "Eiyah command link is missing or invalid: {}",
+                entry.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    let metadata = load_install_metadata(&metadata_path).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation information is missing or invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    ResolvedPaths::from_install_metadata(metadata).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation paths are invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })
 }
 
 // lock取得後のuninstall処理を仕様順に実行する
@@ -473,7 +555,7 @@ fn uninstall_locked(paths: &ResolvedPaths, home: &Path, cleanup_plan: &Path) -> 
     uninstall_preflight(paths, home)?;
     write_final_cleanup_plan(paths, home, cleanup_plan)?;
     crate::ui::print_operation("Unlinking configuration files")?;
-    unstow_managed_packages(paths, home)?;
+    unstow_managed_packages(paths, home).map_err(incomplete_uninstall)?;
     crate::ui::print_operation("Removing show-cad-status")?;
     crate::ui::print_detail(
         &home
@@ -481,25 +563,33 @@ fn uninstall_locked(paths: &ResolvedPaths, home: &Path, cleanup_plan: &Path) -> 
             .display()
             .to_string(),
     )?;
-    remove_show_cad_status_entry(paths, home)?;
-    remove_managed_content(paths, home)?;
-    restore_home_backups(paths, home)?;
-    validate_uninstallation(paths, home)?;
-    cleanup_uninstall_cache(paths)
+    remove_show_cad_status_entry(paths, home).map_err(incomplete_uninstall)?;
+    remove_managed_content(paths, home).map_err(incomplete_uninstall)?;
+    restore_home_backups(paths, home).map_err(incomplete_uninstall)?;
+    validate_uninstallation(paths, home).map_err(incomplete_uninstall)?;
+    cleanup_uninstall_cache(paths).map_err(incomplete_uninstall)
+}
+
+// destructive uninstall開始後のfailureへincomplete stateを付加する
+fn incomplete_uninstall(error: anyhow::Error) -> anyhow::Error {
+    crate::ui::UserFacingError::with_hint(error, "Uninstallation is incomplete.").into()
 }
 
 // installed metadata由来pathをshell向けfixed-order protocolへ記録する
 fn write_final_cleanup_plan(paths: &ResolvedPaths, home: &Path, target: &Path) -> Result<()> {
     if !target.is_absolute() {
-        bail!("final cleanup plan path must be absolute");
+        bail!("temporary uninstall information path must be absolute");
     }
     let parent = target
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("final cleanup plan path has no parent"))?;
-    validate_non_symlink_directory(parent, "final cleanup plan parent")?;
+        .ok_or_else(|| anyhow::anyhow!("temporary uninstall information path has no parent"))?;
+    validate_non_symlink_directory(parent, "temporary uninstall information parent")?;
     match fs::symlink_metadata(target) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Ok(_) => bail!("final cleanup plan already exists: {}", target.display()),
+        Ok(_) => bail!(
+            "temporary uninstall information already exists: {}",
+            target.display()
+        ),
         Err(error) => return Err(error.into()),
     }
 
@@ -519,7 +609,12 @@ fn write_final_cleanup_plan(paths: &ResolvedPaths, home: &Path, target: &Path) -
         .create_new(true)
         .mode(0o600)
         .open(target)
-        .with_context(|| format!("failed to create final cleanup plan {}", target.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to create temporary uninstall information {}",
+                target.display()
+            )
+        })?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
@@ -563,7 +658,10 @@ fn uninstall_preflight(paths: &ResolvedPaths, home: &Path) -> Result<()> {
     validate_non_symlink_directory(&paths.pixi_home, "Pixi home")?;
     validate_expected_executable(&paths.pixi_home.join("bin/stow"), "Stow")?;
     validate_optional_directory(&paths.state_home.join("eiyah/backup"), "backup directory")?;
-    validate_optional_uninstall_file(&paths.state_home.join("eiyah/backup/index"), "backup index")
+    validate_optional_uninstall_file(
+        &paths.state_home.join("eiyah/backup/index"),
+        "saved configuration information",
+    )
 }
 
 /// managed content削除とbackup復元の完了状態を変更せず検証する
@@ -587,8 +685,8 @@ fn validate_uninstallation(paths: &ResolvedPaths, home: &Path) -> Result<()> {
         &home.join(".local/bin/eiyah"),
         &paths.eiyah_prefix.join("bin/eiyah"),
     )?;
-    validate_non_symlink_directory(&paths.state_home.join("eiyah"), "state root")?;
-    validate_regular_non_symlink(&paths.state_home.join("eiyah/lock"), "operation lock")?;
+    validate_non_symlink_directory(&paths.state_home.join("eiyah"), "Eiyah data directory")?;
+    validate_regular_non_symlink(&paths.state_home.join("eiyah/lock"), "Eiyah lock")?;
 
     let backup_root = paths.state_home.join("eiyah/backup/home");
     match fs::symlink_metadata(&backup_root) {
@@ -836,7 +934,7 @@ mod tests {
             Ok(())
         })
         .unwrap_err();
-        assert!(error.to_string().contains("identity changed"));
+        assert!(error.to_string().contains("changed during uninstall"));
         assert_eq!(fs::read(&target)?, b"other owner");
         assert_eq!(fs::read(&original)?, b"original");
         Ok(())
@@ -897,7 +995,7 @@ mod tests {
             Ok(())
         })
         .unwrap_err();
-        assert!(error.to_string().contains("identity changed"));
+        assert!(error.to_string().contains("changed during uninstall"));
         assert_eq!(fs::read(target.join("other"))?, b"other owner");
         assert_eq!(fs::read(original.join("owned"))?, b"owned");
         Ok(())
@@ -955,7 +1053,10 @@ mod tests {
             b"76616c6964\n7a00\n".as_slice(),
         ] {
             fs::write(&index, content)?;
-            assert!(restore_home_backups(&paths, &home).is_err());
+            let error = restore_home_backups(&paths, &home).unwrap_err();
+            let message = error.to_string();
+            assert!(message.starts_with("saved configuration information is"));
+            assert!(!message.contains("backup index"));
             assert!(!home.join("valid").exists());
         }
         Ok(())
@@ -1141,12 +1242,44 @@ mod tests {
         fs::write(home.join("b"), b"collision")?;
 
         let error = restore_home_backups(&paths, &home).unwrap_err();
-        assert!(error.to_string().contains("b"));
+        let mut output = Vec::new();
+        crate::ui::write_error_report(&mut output, &error, false)?;
+        let output = String::from_utf8(output)?;
+        assert!(output.starts_with("Error: failed to restore b: "));
+        assert!(
+            output.contains("Warning: Some previous configuration has already been restored.\n")
+        );
+        assert!(output.ends_with("Hint: Uninstallation is incomplete.\n"));
         assert_eq!(fs::read(home.join("a"))?, b"a");
         assert!(!root.join("a").exists());
         assert_eq!(fs::read(home.join("b"))?, b"collision");
         assert_eq!(fs::read(root.join("b"))?, b"b");
         assert_eq!(fs::read(root.join("c"))?, b"c");
+        assert!(index.exists());
+        Ok(())
+    }
+
+    #[test]
+    // restore完了後のcleanup failureでも復元済み状態をWarningへ反映する
+    fn reports_restored_state_when_backup_cleanup_fails() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        fs::create_dir(&home)?;
+        let relative = Path::new("restored");
+        let (root, index) = create_backup_fixture(&paths, &[relative])?;
+        fs::write(root.join(relative), b"backup")?;
+
+        let error =
+            restore_home_backups_with(&paths, &home, |_, _| Ok(()), |_| bail!("cleanup failed"))
+                .unwrap_err();
+        let mut output = Vec::new();
+        crate::ui::write_error_report(&mut output, &error, false)?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            "Error: failed to finish restoring previous configuration: cleanup failed\nWarning: Some previous configuration has already been restored.\nHint: Uninstallation is incomplete.\n"
+        );
+        assert_eq!(fs::read(home.join(relative))?, b"backup");
         assert!(index.exists());
         Ok(())
     }
@@ -1217,6 +1350,23 @@ mod tests {
         create_installed_fixture(&paths, &home.join(".local/bin/eiyah"))?;
 
         assert_eq!(load_uninstall_paths(&home)?, paths);
+        Ok(())
+    }
+
+    #[test]
+    // invalid installation informationを内部用語なしのdiagnosticへ変換する
+    fn reports_invalid_uninstall_installation_information() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/eiyah");
+        create_installed_fixture(&paths, &entry)?;
+        fs::write(paths.eiyah_prefix.join("install.toml"), b"invalid")?;
+
+        let error = load_uninstall_paths(&home).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("installation information is missing or invalid:"));
+        assert!(!message.contains("metadata"));
         Ok(())
     }
 

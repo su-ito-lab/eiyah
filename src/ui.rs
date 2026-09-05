@@ -4,6 +4,7 @@
 // ==================================================
 
 use std::env;
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 
 #[cfg(test)]
@@ -27,6 +28,62 @@ const ANSI_ERROR: &str = "\x1b[1;91m";
 const ANSI_WARNING: &str = "\x1b[1;93m";
 // Hint label用bold bright cyan
 const ANSI_HINT: &str = "\x1b[1;96m";
+
+/// primary Errorへ残存状態のWarning / Hintを付加するuser-facing failure
+#[derive(Debug)]
+pub(crate) struct UserFacingError {
+    message: String,
+    warnings: Vec<String>,
+    hints: Vec<String>,
+}
+
+impl UserFacingError {
+    /// 表示順を保持したlifecycle diagnosticを構成する
+    pub(crate) fn new(
+        message: impl Into<String>,
+        warnings: Vec<String>,
+        hints: Vec<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            warnings,
+            hints,
+        }
+    }
+
+    /// 既存reportを維持して追加Warningを末尾へ加える
+    pub(crate) fn with_warning(error: anyhow::Error, warning: impl Into<String>) -> Self {
+        match error.downcast::<Self>() {
+            Ok(mut report) => {
+                report.warnings.push(warning.into());
+                report
+            }
+            Err(error) => Self::new(format!("{error:#}"), vec![warning.into()], Vec::new()),
+        }
+    }
+
+    /// 既存reportを維持して追加Hintを重複なく末尾へ加える
+    pub(crate) fn with_hint(error: anyhow::Error, hint: impl Into<String>) -> Self {
+        let hint = hint.into();
+        match error.downcast::<Self>() {
+            Ok(mut report) => {
+                if !report.hints.contains(&hint) {
+                    report.hints.push(hint);
+                }
+                report
+            }
+            Err(error) => Self::new(format!("{error:#}"), Vec::new(), vec![hint]),
+        }
+    }
+}
+
+impl fmt::Display for UserFacingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UserFacingError {}
 
 // 対象streamがTTYかつNO_COLOR未設定の場合だけstyleを有効にする
 fn style_enabled(is_terminal: bool, no_color: bool) -> bool {
@@ -160,6 +217,39 @@ pub(crate) fn print_error(message: &str) {
         ),
     )
     .expect("failed printing to stderr");
+}
+
+// primary Errorの後へ残存状態のWarning / Hintを連続表示する
+pub(crate) fn print_error_report(error: &anyhow::Error) {
+    write_error_report(
+        &mut io::stderr().lock(),
+        error,
+        style_enabled(
+            io::stderr().is_terminal(),
+            env::var_os("NO_COLOR").is_some(),
+        ),
+    )
+    .expect("failed printing to stderr");
+}
+
+// user-facing failureをprimary Errorから順に指定outputへ書き出す
+pub(crate) fn write_error_report(
+    output: &mut impl Write,
+    error: &anyhow::Error,
+    styled: bool,
+) -> io::Result<()> {
+    if let Some(report) = error.downcast_ref::<UserFacingError>() {
+        write_diagnostic(output, "Error", &report.message, styled)?;
+        for warning in &report.warnings {
+            write_diagnostic(output, "Warning", warning, styled)?;
+        }
+        for hint in &report.hints {
+            write_diagnostic(output, "Hint", hint, styled)?;
+        }
+    } else {
+        write_diagnostic(output, "Error", &format!("{error:#}"), styled)?;
+    }
+    Ok(())
 }
 
 // --------------------------------------------------

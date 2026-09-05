@@ -61,14 +61,14 @@ fn fetch_latest_release() -> Result<ReleaseResponse> {
         .header("Accept", GITHUB_ACCEPT)
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .call()
-        .context("failed to fetch latest Public Release")?;
+        .context("failed to fetch latest Eiyah release")?;
     parse_release_response(response.body_mut())
 }
 
 // GitHub response bodyから更新判定に必要なfieldだけをdecodeする
 fn parse_release_response(body: &mut ureq::Body) -> Result<ReleaseResponse> {
     body.read_json()
-        .context("failed to parse latest Public Release response")
+        .context("failed to parse latest Eiyah release response")
 }
 
 /// `v<SEMVER>` 形式のRelease tagをversionへ変換する
@@ -102,9 +102,9 @@ fn download_to_file(url: &str, path: &Path) -> Result<()> {
         .create_new(true)
         .mode(CANDIDATE_DOWNLOAD_MODE)
         .open(path)
-        .with_context(|| format!("failed to create candidate {}", path.display()))?;
+        .with_context(|| format!("failed to create downloaded Eiyah {}", path.display()))?;
     io::copy(&mut response.body_mut().as_reader(), &mut file)
-        .with_context(|| format!("failed to write candidate {}", path.display()))?;
+        .with_context(|| format!("failed to write downloaded Eiyah {}", path.display()))?;
     file.flush()?;
     file.sync_all()?;
     Ok(())
@@ -171,10 +171,44 @@ fn validate_eiyah_binary(path: &Path, expected_version: &Version) -> Result<()> 
 /// installed metadataからpathを復元してexclusive lock内で更新する
 pub(crate) fn run_update() -> Result<()> {
     let home = runtime_home()?;
-    let metadata_path = discover_install_metadata(&home.join(".local/bin/eiyah"))?;
-    let paths = ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)?;
+    let paths = load_update_paths(&home)?;
     let _lock = LockGuard::acquire(&paths.state_home)?;
     update_locked(&paths, false)
+}
+
+// Eiyah command linkから利用者向けdiagnostic付きでupdate pathを復元する
+fn load_update_paths(home: &Path) -> Result<ResolvedPaths> {
+    let entry = home.join(".local/bin/eiyah");
+    let metadata_path = discover_install_metadata(&entry).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "Eiyah command link is missing or invalid: {}",
+                entry.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    let metadata = load_install_metadata(&metadata_path).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation information is missing or invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })?;
+    ResolvedPaths::from_install_metadata(metadata).map_err(|_| {
+        anyhow::Error::new(crate::ui::UserFacingError::new(
+            format!(
+                "installation paths are invalid: {}",
+                metadata_path.display()
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+    })
 }
 
 /// callerが保持するoperation lock内でEiyah binaryを更新する
@@ -247,7 +281,20 @@ fn update_locked_with(
         cleanup_candidate(&candidate);
         return Err(error.into());
     }
-    validate_eiyah_binary(&installed, &release.version)?;
+    if validate_eiyah_binary(&installed, &release.version).is_err() {
+        return Err(crate::ui::UserFacingError::new(
+            format!(
+                "Eiyah validation failed after updating to {}.",
+                release.version
+            ),
+            vec![format!(
+                "Eiyah {} is already installed and was not reverted.",
+                release.version
+            )],
+            Vec::new(),
+        )
+        .into());
+    }
     crate::ui::print_operation(&format!("Eiyah updated to {}", release.version))?;
     Ok(())
 }
@@ -255,10 +302,10 @@ fn update_locked_with(
 // stable flagとrequired assetから更新情報を組み立てる
 fn validate_release_version(release: &ReleaseResponse) -> Result<Version> {
     if release.draft {
-        bail!("latest Public Release is a draft");
+        bail!("latest Eiyah release is a draft");
     }
     if release.prerelease {
-        bail!("latest Public Release is a prerelease");
+        bail!("latest Eiyah release is a prerelease");
     }
     parse_release_version(&release.tag_name)
 }
@@ -307,7 +354,7 @@ fn prepare_candidate_path(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path)?,
         Ok(_) => bail!(
-            "update candidate path must be missing or a regular file: {}",
+            "downloaded Eiyah path must be missing or a regular file: {}",
             path.display()
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -370,6 +417,23 @@ mod tests {
         fs::create_dir_all(binary.parent().unwrap())?;
         write_version_binary(&binary, env!("CARGO_PKG_VERSION"))?;
         Ok(paths)
+    }
+
+    #[test]
+    // invalid installation informationを内部用語なしのdiagnosticへ変換する
+    fn reports_invalid_update_installation_information() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let paths = fixture_paths(&directory.path)?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/eiyah");
+        create_installed_fixture(&paths, &entry)?;
+        fs::write(paths.eiyah_prefix.join("install.toml"), b"invalid")?;
+
+        let error = load_update_paths(&home).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("installation information is missing or invalid:"));
+        assert!(!message.contains("metadata"));
+        Ok(())
     }
 
     // current package versionより大きいupdate test用versionを作成する
@@ -570,18 +634,25 @@ mod tests {
         );
         let checksum = checksum_text(content.as_bytes());
 
-        assert!(
-            update_locked_with(
-                &paths,
-                false,
-                || Ok(newer_release(&version)),
-                |_, path| {
-                    fs::write(path, content.as_bytes())?;
-                    Ok(())
-                },
-                |_| Ok(checksum.clone()),
+        let error = update_locked_with(
+            &paths,
+            false,
+            || Ok(newer_release(&version)),
+            |_, path| {
+                fs::write(path, content.as_bytes())?;
+                Ok(())
+            },
+            |_| Ok(checksum.clone()),
+        )
+        .unwrap_err();
+
+        let mut output = Vec::new();
+        crate::ui::write_error_report(&mut output, &error, false)?;
+        assert_eq!(
+            String::from_utf8(output)?,
+            format!(
+                "Error: Eiyah validation failed after updating to {version}.\nWarning: Eiyah {version} is already installed and was not reverted.\n"
             )
-            .is_err()
         );
 
         let installed = paths.eiyah_prefix.join("bin/eiyah");

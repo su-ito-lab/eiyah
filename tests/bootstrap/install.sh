@@ -201,7 +201,7 @@ set -e
 /usr/bin/chmod 0755 "$TMPDIR"
 [[ $cleanup_failure_status -eq 23 ]] || fail 'cleanup failure replaced the lifecycle status'
 cleanup_failure_error=$(<"$test_root/cleanup-failure-error")
-[[ $cleanup_failure_error == *'Warning: failed to cleanup bootstrap temporary directory: '* ]] \
+[[ $cleanup_failure_error == *'Warning: failed to remove temporary files: '* ]] \
     || fail 'cleanup failure did not emit a warning'
 /usr/bin/rm --recursive --force -- "$TMPDIR"/eiyah-bootstrap.*
 
