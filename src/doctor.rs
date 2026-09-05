@@ -16,6 +16,9 @@ use crate::config::{
 };
 use crate::ui::print_warning;
 
+// issueがない場合のdoctor result
+const HEALTHY_MESSAGE: &str = "Your system is ready to use Eiyah.";
+
 // 全診断項目を収集しWarningまたはsuccess messageを表示する
 pub(super) fn run_doctor() -> Result<bool> {
     let mut issues = Vec::new();
@@ -32,19 +35,24 @@ pub(super) fn run_doctor() -> Result<bool> {
         match load_installed_paths() {
             Ok(paths) => diagnose_installed_paths(home, &paths, &mut issues),
             Err(error) => issues.push(format!(
-                "installed Eiyah paths could not be recovered: {error:#}"
+                "Eiyah installation information could not be read: {error:#}"
             )),
         }
     }
     diagnose_login_shell(&mut issues);
     diagnose_host_compatibility(&mut issues);
 
+    report_doctor(issues, print_warning)
+}
+
+// collected issueをhealthy resultまたはWarning列へ変換する
+fn report_doctor(issues: Vec<String>, mut warn: impl FnMut(&str)) -> Result<bool> {
     if issues.is_empty() {
-        println!("Your system is ready to use Eiyah.");
+        crate::ui::print_detail(HEALTHY_MESSAGE)?;
         Ok(true)
     } else {
         for issue in issues {
-            print_warning(&issue);
+            warn(&issue);
         }
         Ok(false)
     }
@@ -73,7 +81,7 @@ fn diagnose_installed_paths(home: &Path, paths: &ResolvedPaths, issues: &mut Vec
     diagnose_eiyah_symlink(home, &binary, issues);
     if load_config(&paths.eiyah_config).is_err() {
         issues.push(format!(
-            "config.toml is missing or invalid: {}",
+            "Eiyah config is missing or invalid: {}",
             paths.eiyah_config.display()
         ));
     }
@@ -88,8 +96,17 @@ fn diagnose_installed_paths(home: &Path, paths: &ResolvedPaths, issues: &mut Vec
 
     let status_binary = paths.eiyah_prefix.join("bin/show-cad-status");
     let status_entry = home.join(".local/bin/show-cad-status");
-    if !is_executable(&status_binary) || !is_expected_symlink(&status_entry, &status_binary) {
-        issues.push("show-cad-status installation is invalid".to_owned());
+    if !is_executable(&status_binary) {
+        issues.push(format!(
+            "show-cad-status binary is not executable: {}",
+            status_binary.display()
+        ));
+    }
+    if !is_expected_symlink(&status_entry, &status_binary) {
+        issues.push(format!(
+            "show-cad-status command link is invalid: {}",
+            status_entry.display()
+        ));
     }
 }
 
@@ -97,30 +114,46 @@ fn diagnose_installed_paths(home: &Path, paths: &ResolvedPaths, issues: &mut Vec
 fn diagnose_eiyah_symlink(home: &Path, binary: &Path, issues: &mut Vec<String>) {
     let public_entry = home.join(".local/bin/eiyah");
     if !is_expected_symlink(&public_entry, binary) {
-        issues.push("Eiyah public symlink is invalid".to_owned());
+        issues.push(format!(
+            "Eiyah command link is invalid: {}",
+            public_entry.display()
+        ));
     }
 }
 
 // configured login shellがcsh / tcsh familyであることを診断する
 fn diagnose_login_shell(issues: &mut Vec<String>) {
     let shell = env::var_os("SHELL").map(PathBuf::from);
+    diagnose_login_shell_value(shell.as_deref(), issues);
+}
+
+// login shellの実値を保持してcsh / tcsh familyを診断する
+fn diagnose_login_shell_value(shell: Option<&Path>, issues: &mut Vec<String>) {
     let valid = shell
-        .as_deref()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "csh" || name == "tcsh");
     if !valid {
-        issues.push("login shell is not csh or tcsh".to_owned());
+        let actual = shell
+            .as_deref()
+            .map(|value| value.as_os_str().to_string_lossy().into_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "N/A".to_owned());
+        issues.push(format!("Login shell is not csh or tcsh: {actual}"));
     }
 }
 
 // OS / architecture / glibcのhost compatibilityを診断する
 fn diagnose_host_compatibility(issues: &mut Vec<String>) {
-    let os_compatible = os_release_value("ID").as_deref() == Some("almalinux")
-        && os_release_value("VERSION_ID")
-            .as_deref()
-            .and_then(|version| version.split('.').next())
-            == Some("8");
+    let os = os_release_value("PRETTY_NAME");
+    let os_id = os_release_value("ID");
+    let os_version = os_release_value("VERSION_ID");
+    diagnose_os_compatibility(
+        os.as_deref(),
+        os_id.as_deref(),
+        os_version.as_deref(),
+        issues,
+    );
     let architecture = command_line("uname", &["-m"]);
     let glibc = command_line("getconf", &["GNU_LIBC_VERSION"]);
     let glibc_compatible = glibc
@@ -128,9 +161,52 @@ fn diagnose_host_compatibility(issues: &mut Vec<String>) {
         .and_then(|value| value.split_whitespace().last())
         .and_then(parse_major_minor)
         .is_some_and(|version| version >= (2, 28));
-    if !os_compatible || architecture.as_deref() != Some("x86_64") || !glibc_compatible {
-        issues
-            .push("host is not compatible with AlmaLinux 8.x / x86_64 / glibc >= 2.28".to_owned());
+    diagnose_host_compatibility_values(
+        architecture.as_deref(),
+        glibc.as_deref(),
+        glibc_compatible,
+        issues,
+    );
+}
+
+// os-releaseの必要field取得後にAlmaLinux 8.x compatibilityを診断する
+fn diagnose_os_compatibility(
+    os: Option<&str>,
+    os_id: Option<&str>,
+    os_version: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    let (Some(os), Some(os_id), Some(os_version)) = (os, os_id, os_version) else {
+        issues.push("OS information could not be read: /etc/os-release".to_owned());
+        return;
+    };
+    if os_id != "almalinux" || os_version.split('.').next() != Some("8") {
+        issues.push(format!("Unsupported OS: {os}"));
+    }
+}
+
+// host情報の実値を原因単位のWarningへ変換する
+fn diagnose_host_compatibility_values(
+    architecture: Option<&str>,
+    glibc: Option<&str>,
+    glibc_compatible: bool,
+    issues: &mut Vec<String>,
+) {
+    if architecture.is_none() {
+        issues.push("Architecture could not be read: uname -m".to_owned());
+    } else if architecture.as_deref() != Some("x86_64") {
+        issues.push(format!(
+            "Unsupported architecture: {}",
+            architecture.expect("architecture value was checked")
+        ));
+    }
+    if glibc.is_none() {
+        issues.push("Host glibc could not be read: getconf GNU_LIBC_VERSION".to_owned());
+    } else if !glibc_compatible {
+        issues.push(format!(
+            "Host glibc is too old: {}",
+            glibc.expect("glibc value was checked")
+        ));
     }
 }
 
@@ -199,8 +275,77 @@ mod tests {
         let mut issues = Vec::new();
         diagnose_eiyah_symlink(&home, &expected, &mut issues);
 
-        assert_eq!(issues, ["Eiyah public symlink is invalid"]);
+        assert_eq!(
+            issues,
+            [format!(
+                "Eiyah command link is invalid: {}",
+                public_entry.display()
+            )]
+        );
         fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[test]
+    // login shellとhost incompatibilityを実値付きの個別Warningへ変換する
+    fn reports_specific_runtime_values() {
+        let mut issues = Vec::new();
+        diagnose_login_shell_value(Some(Path::new("/bin/bash")), &mut issues);
+        diagnose_os_compatibility(Some("Other Linux"), Some("other"), Some("1"), &mut issues);
+        diagnose_host_compatibility_values(Some("aarch64"), Some("glibc 2.17"), false, &mut issues);
+        assert_eq!(
+            issues,
+            [
+                "Login shell is not csh or tcsh: /bin/bash",
+                "Unsupported OS: Other Linux",
+                "Unsupported architecture: aarch64",
+                "Host glibc is too old: glibc 2.17",
+            ]
+        );
+    }
+
+    #[test]
+    // runtime情報取得failureをunsupported判定と区別して取得元付きで報告する
+    fn reports_runtime_information_failures() {
+        let mut issues = Vec::new();
+        diagnose_os_compatibility(None, None, None, &mut issues);
+        diagnose_host_compatibility_values(None, None, false, &mut issues);
+        assert_eq!(
+            issues,
+            [
+                "OS information could not be read: /etc/os-release",
+                "Architecture could not be read: uname -m",
+                "Host glibc could not be read: getconf GNU_LIBC_VERSION",
+            ]
+        );
+    }
+
+    #[test]
+    // PRETTY_NAMEがあってもIDまたはVERSION_ID欠落を取得failureとして報告する
+    fn reports_missing_os_compatibility_fields() {
+        for (os_id, os_version) in [(None, Some("8.10")), (Some("almalinux"), None)] {
+            let mut issues = Vec::new();
+            diagnose_os_compatibility(Some("AlmaLinux 8.10"), os_id, os_version, &mut issues);
+            assert_eq!(
+                issues,
+                ["OS information could not be read: /etc/os-release"]
+            );
+        }
+    }
+
+    #[test]
+    // healthy resultとissue時のWarningだけをexactに出力する
+    fn reports_doctor_results() -> Result<()> {
+        let (result, output) = crate::ui::capture_stdout(|| report_doctor(Vec::new(), |_| {}));
+        assert!(result?);
+        assert_eq!(output, "Your system is ready to use Eiyah.\n");
+
+        let warnings = std::cell::RefCell::new(Vec::new());
+        assert!(!report_doctor(
+            vec!["first".to_owned(), "second".to_owned()],
+            |warning| warnings.borrow_mut().push(warning.to_owned()),
+        )?);
+        assert_eq!(*warnings.borrow(), ["first", "second"]);
         Ok(())
     }
 }

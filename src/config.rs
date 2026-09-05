@@ -627,10 +627,32 @@ pub fn set_show_cad_status(enabled: bool) -> Result<()> {
 // HOMEを差し替え可能にしてinstalled configを更新する
 fn set_show_cad_status_from_home(home: &Path, enabled: bool) -> Result<()> {
     let paths = load_installed_paths_from_home(home)?;
-    let _lock = LockGuard::acquire(&paths.state_home)?;
-    let mut config = load_config(&paths.eiyah_config)?;
+    let config_path = paths.eiyah_config.clone();
+    let _lock = LockGuard::acquire(&paths.state_home).map_err(|error| {
+        let detail = if error.to_string() == "another Eiyah operation is already running." {
+            error.to_string()
+        } else {
+            "exclusive access could not be acquired".to_owned()
+        };
+        config_update_error(&config_path, &detail)
+    })?;
+    let mut config = load_config(&config_path)
+        .map_err(|_| config_update_error(&config_path, "the config could not be read or parsed"))?;
     config.show_cad_status = enabled;
-    save_config(&paths.eiyah_config, &config)
+    save_config(&config_path, &config)
+        .map_err(|_| config_update_error(&config_path, "the config changes could not be saved"))
+}
+
+// config更新failureを保存方式に依存しないuser-facing errorへ変換する
+fn config_update_error(path: &Path, detail: &str) -> anyhow::Error {
+    anyhow::Error::new(crate::ui::UserFacingError::new(
+        format!(
+            "failed to update Eiyah config: {}: {detail}",
+            path.display()
+        ),
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 /// 指定configのshow-cad-status設定を返す
@@ -1260,8 +1282,50 @@ mod tests {
         assert!(!load_config(&fallback_config)?.show_cad_status);
 
         let _lock = LockGuard::acquire(&paths.state_home)?;
-        assert!(set_show_cad_status_from_home(&home, false).is_err());
+        let error = set_show_cad_status_from_home(&home, false).unwrap_err();
+        assert!(error.to_string().starts_with(&format!(
+            "failed to update Eiyah config: {}: ",
+            paths.eiyah_config.display()
+        )));
+        assert!(!error.to_string().contains("temporary"));
+        assert!(!error.to_string().contains("atomic"));
         assert!(load_config(&paths.eiyah_config)?.show_cad_status);
+        Ok(())
+    }
+
+    #[test]
+    // config save failureでatomic save等の内部実装用語を露出しない
+    fn hides_config_save_implementation_details() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let paths = paths_under(&directory.path.join("metadata-xdg"));
+        let binary = paths.eiyah_prefix.join("bin/eiyah");
+        let public_entry = home.join(".local/bin/eiyah");
+        let actual_config = directory.path.join("actual-config.toml");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        fs::create_dir_all(public_entry.parent().unwrap())?;
+        fs::create_dir_all(paths.eiyah_config.parent().unwrap())?;
+        symlink(&binary, &public_entry)?;
+        save_install_metadata(&paths)?;
+        save_config(
+            &actual_config,
+            &Config {
+                show_cad_status: false,
+            },
+        )?;
+        symlink(&actual_config, &paths.eiyah_config)?;
+
+        let error = set_show_cad_status_from_home(&home, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed to update Eiyah config: {}: the config changes could not be saved",
+                paths.eiyah_config.display()
+            )
+        );
+        assert!(!error.to_string().contains("temporary"));
+        assert!(!error.to_string().contains("atomic"));
+        assert!(!load_config(&actual_config)?.show_cad_status);
         Ok(())
     }
 

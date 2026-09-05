@@ -51,12 +51,16 @@ enum Command {
         cleanup_plan: PathBuf,
     },
     // Public ReleaseからEiyah binaryを更新する
+    #[command(about = "Update Eiyah")]
     Update,
     // Eiyahとsystem configurationを表示する
+    #[command(about = "Show Eiyah and system configuration information")]
     Config,
     // Eiyah installationを診断する
+    #[command(about = "Check the system for potential problems")]
     Doctor,
     // CAD status表示または表示設定を操作する
+    #[command(about = "Show or configure CAD status")]
     ShowCadStatus {
         // show-cad-status設定の変更action
         #[command(subcommand)]
@@ -74,8 +78,10 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ShowCadStatusAction {
     // shell handoff前のstatus表示を有効化する
+    #[command(about = "Enable show-cad-status")]
     Enable,
     // shell handoff前のstatus表示を無効化する
+    #[command(about = "Disable show-cad-status")]
     Disable,
 }
 
@@ -137,13 +143,13 @@ fn run_with(
         Command::ShowCadStatus {
             action: Some(ShowCadStatusAction::Enable),
         } => {
-            set_show_cad_status(true)?;
+            configure_show_cad_status(true, set_show_cad_status)?;
             Ok(0)
         }
         Command::ShowCadStatus {
             action: Some(ShowCadStatusAction::Disable),
         } => {
-            set_show_cad_status(false)?;
+            configure_show_cad_status(false, set_show_cad_status)?;
             Ok(0)
         }
         Command::Handoff => match handoff() {
@@ -165,9 +171,28 @@ fn run_with(
     }
 }
 
+// show-cad-status設定更新後にcommand resultを表示する
+fn configure_show_cad_status(
+    enabled: bool,
+    configure: impl FnOnce(bool) -> Result<()>,
+) -> Result<()> {
+    configure(enabled)?;
+    ui::print_detail(if enabled {
+        "show-cad-status is enabled."
+    } else {
+        "show-cad-status is disabled."
+    })?;
+    Ok(())
+}
+
 // Public show-cad-status entryを継承streamで実行する
 fn run_show_cad_status() -> Result<u8> {
     let executable = runtime_home()?.join(".local/bin/show-cad-status");
+    execute_show_cad_status(&executable)
+}
+
+// resolved show-cad-statusをtransparentなprocess wrapperとして実行する
+fn execute_show_cad_status(executable: &Path) -> Result<u8> {
     let status = ProcessCommand::new(&executable)
         .status()
         .with_context(|| format!("failed to execute {}", executable.display()))?;
@@ -222,6 +247,35 @@ mod tests {
         assert!(!help.contains("__uninstall"));
         assert!(!help.contains("__handoff"));
         assert!(!help.contains("__show-cad-status-enabled"));
+        for description in [
+            "Update Eiyah",
+            "Show Eiyah and system configuration information",
+            "Check the system for potential problems",
+            "Show or configure CAD status",
+        ] {
+            assert!(help.contains(description));
+        }
+
+        let help = ShowCadStatusAction::augment_subcommands(clap::Command::new("show-cad-status"))
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Enable show-cad-status"));
+        assert!(help.contains("Disable show-cad-status"));
+    }
+
+    #[test]
+    // enable / disable成功時にexact command resultを表示する
+    fn displays_show_cad_status_configuration_results() -> Result<()> {
+        for (enabled, expected) in [
+            (true, "show-cad-status is enabled.\n"),
+            (false, "show-cad-status is disabled.\n"),
+        ] {
+            let (result, output) =
+                ui::capture_stdout(|| configure_show_cad_status(enabled, |_| Ok(())));
+            result?;
+            assert_eq!(output, expected);
+        }
+        Ok(())
     }
 
     #[test]
@@ -306,7 +360,22 @@ mod tests {
             )?,
             37
         );
+        assert_eq!(
+            child_exit_status(std::process::ExitStatus::from_raw(libc::SIGTERM))
+                .unwrap_err()
+                .to_string(),
+            "show-cad-status terminated by signal"
+        );
         Ok(())
+    }
+
+    #[test]
+    // show-cad-status spawn failureへresolved pathとOS detailを付加する
+    fn reports_show_cad_status_spawn_failure() {
+        let executable = Path::new("/missing/show-cad-status");
+        let error = execute_show_cad_status(executable).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.starts_with("failed to execute /missing/show-cad-status: "));
     }
 
     #[test]
