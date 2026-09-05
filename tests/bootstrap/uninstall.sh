@@ -267,7 +267,7 @@ expected_main_output=$(printf '%s\n' '==> Eiyah will remove:' 'Eiyah' 'show-cad-
     "$RELEASE_DOWNLOAD_ROOT/v1.2.3/$BINARY_ASSET" '' \
     '==> Verifying Eiyah download' 'SHA-256: verified' \
     "$FAKE_UNINSTALL_OUTPUT" '' '==> Removing Eiyah' "$fixture_entry" '' \
-    '==> Eiyah uninstall complete')
+    '==> Eiyah uninstallation complete')
 [[ $main_output == "$expected_main_output" ]] || fail 'uninstall output did not match the UI contract'
 [[ ! -e $fixture_entry && ! -L $fixture_entry ]] || fail 'bootstrap did not remove public entry'
 [[ ! -e $fixture_binary ]] || fail 'bootstrap did not remove installed binary'

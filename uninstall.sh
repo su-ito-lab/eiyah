@@ -326,7 +326,7 @@ main() {
         hint 'Uninstallation is incomplete.'
         return 1
     fi
-    operation 'Eiyah uninstall complete'
+    operation 'Eiyah uninstallation complete'
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

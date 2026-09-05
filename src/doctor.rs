@@ -77,10 +77,7 @@ fn diagnose_dotfiles(home: &Path, issues: &mut Vec<String>) {
 fn diagnose_installed_paths(home: &Path, paths: &ResolvedPaths, issues: &mut Vec<String>) {
     let binary = paths.eiyah_prefix.join("bin/eiyah");
     if !is_executable(&binary) {
-        issues.push(format!(
-            "Eiyah binary is not executable: {}",
-            binary.display()
-        ));
+        issues.push(format!("Eiyah is not executable: {}", binary.display()));
     }
     diagnose_eiyah_symlink(home, &binary, issues);
     if load_config(&paths.eiyah_config).is_err() {
@@ -119,7 +116,7 @@ fn diagnose_eiyah_symlink(home: &Path, binary: &Path, issues: &mut Vec<String>) 
     let public_entry = home.join(".local/bin/eiyah");
     if !is_expected_symlink(&public_entry, binary) {
         issues.push(format!(
-            "Eiyah command link is invalid: {}",
+            "Eiyah command is invalid: {}",
             public_entry.display()
         ));
     }
@@ -282,12 +279,41 @@ mod tests {
         assert_eq!(
             issues,
             [format!(
-                "Eiyah command link is invalid: {}",
+                "Eiyah command is invalid: {}",
                 public_entry.display()
             )]
         );
         fs::remove_dir_all(home)?;
         Ok(())
+    }
+
+    #[test]
+    // executableでないEiyahをexact user-facing issueへ変換する
+    fn reports_non_executable_eiyah() {
+        let root = std::env::temp_dir().join(format!(
+            "eiyah-doctor-non-executable-test-{}",
+            std::process::id()
+        ));
+        let paths = ResolvedPaths {
+            config_home: root.join("config"),
+            data_home: root.join("data"),
+            state_home: root.join("state"),
+            cache_home: root.join("cache"),
+            eiyah_prefix: root.join("prefix"),
+            eiyah_config: root.join("config/eiyah/config.toml"),
+            pixi_home: root.join("pixi"),
+        };
+        let mut issues = Vec::new();
+
+        diagnose_installed_paths(&root, &paths, &mut issues);
+
+        assert_eq!(
+            issues[0],
+            format!(
+                "Eiyah is not executable: {}",
+                paths.eiyah_prefix.join("bin/eiyah").display()
+            )
+        );
     }
 
     #[test]
