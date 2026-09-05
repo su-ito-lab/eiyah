@@ -152,7 +152,6 @@ FAKE_INSTALL_STATUS=0
 FAKE_CHECKSUM_VALID=1
 export FAKE_CHECKSUM_VALID FAKE_INSTALL_STATUS TMPDIR
 : >"$invocation_log"
-operation_started=false
 main_output=$(run_main_in_subshell)
 [[ $(<"$invocation_log") == __install ]] || fail 'main did not invoke temporary Eiyah'
 expected_main_output=$(printf '%s\n' '==> Eiyah will install:' 'Eiyah' 'show-cad-status' \
