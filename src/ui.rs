@@ -114,6 +114,15 @@ pub(crate) fn write_operation(
     }
 }
 
+// 指定部分だけをterminal default colorのboldで書き出す
+pub(crate) fn write_bold(output: &mut impl Write, value: &str, styled: bool) -> io::Result<()> {
+    if styled {
+        write!(output, "{ANSI_BOLD}{value}{ANSI_RESET}")
+    } else {
+        write!(output, "{value}")
+    }
+}
+
 // stdoutへoperation間の空行とheadingを出力する
 pub(crate) fn print_operation(message: &str) -> io::Result<()> {
     #[cfg(test)]

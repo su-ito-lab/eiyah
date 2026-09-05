@@ -2090,7 +2090,11 @@ fn authorize_private_repository() -> Result<String> {
         .body_mut()
         .read_json()
         .context("failed to parse GitHub device code response")?;
-    write_device_instructions(&mut io::stdout().lock(), &device)?;
+    write_device_instructions(
+        &mut io::stdout().lock(),
+        &device,
+        crate::ui::stdout_style_enabled(),
+    )?;
     let token = poll_device_token(&agent, &device, issued_at)?;
     crate::ui::print_detail("Authorization complete.")?;
     Ok(token)
@@ -2114,12 +2118,14 @@ fn parse_private_release_response(body: &mut ureq::Body) -> Result<PrivateReleas
 }
 
 // Device Flowのuser向けinstructionだけをstdoutへ出力する
-fn write_device_instructions(output: &mut impl Write, device: &DeviceCodeResponse) -> Result<()> {
-    writeln!(
-        output,
-        "First copy your one-time code: {}",
-        device.user_code
-    )?;
+fn write_device_instructions(
+    output: &mut impl Write,
+    device: &DeviceCodeResponse,
+    styled: bool,
+) -> Result<()> {
+    write!(output, "First copy your one-time code: ")?;
+    crate::ui::write_bold(output, &device.user_code, styled)?;
+    writeln!(output)?;
     writeln!(
         output,
         "Then open {} in your browser.",
@@ -2851,7 +2857,7 @@ mod tests {
         );
         let device: DeviceCodeResponse = body.read_json()?;
         let mut output = Vec::new();
-        write_device_instructions(&mut output, &device)?;
+        write_device_instructions(&mut output, &device, false)?;
         let output = String::from_utf8(output)?;
 
         assert_eq!(device.expires_in, 900);
@@ -2863,6 +2869,15 @@ mod tests {
              Waiting for authorization...\n"
         );
         assert!(!output.contains(&device.device_code));
+
+        let mut styled = Vec::new();
+        write_device_instructions(&mut styled, &device, true)?;
+        assert_eq!(
+            String::from_utf8(styled)?,
+            "First copy your one-time code: \x1b[1mABCD-1234\x1b[0m\n\
+             Then open https://github.com/login/device in your browser.\n\
+             Waiting for authorization...\n"
+        );
         Ok(())
     }
 
