@@ -12,7 +12,8 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::config::{
-    ResolvedPaths, load_config, load_installed_paths, os_release_value, runtime_home,
+    ResolvedPaths, load_config, load_installed_paths_for_ui_from_home, os_release_value,
+    runtime_home,
 };
 use crate::ui::print_warning;
 
@@ -32,17 +33,20 @@ pub(super) fn run_doctor() -> Result<bool> {
 
     if let Some(home) = &home {
         diagnose_dotfiles(home, &mut issues);
-        match load_installed_paths() {
-            Ok(paths) => diagnose_installed_paths(home, &paths, &mut issues),
-            Err(error) => issues.push(format!(
-                "Eiyah installation information could not be read: {error:#}"
-            )),
-        }
+        diagnose_installation(home, &mut issues);
     }
     diagnose_login_shell(&mut issues);
     diagnose_host_compatibility(&mut issues);
 
     report_doctor(issues, print_warning)
+}
+
+// installation pathを復元し、失敗時は根本issueだけを記録する
+fn diagnose_installation(home: &Path, issues: &mut Vec<String>) {
+    match load_installed_paths_for_ui_from_home(home) {
+        Ok(paths) => diagnose_installed_paths(home, &paths, issues),
+        Err(error) => issues.push(error.to_string()),
+    }
 }
 
 // collected issueをhealthy resultまたはWarning列へ変換する
@@ -331,6 +335,25 @@ mod tests {
                 ["OS information could not be read: /etc/os-release"]
             );
         }
+    }
+
+    #[test]
+    // doctor path recoveryでconfigと同じmissing command detailをWarning候補へ保持する
+    fn reports_missing_eiyah_command_for_doctor_recovery() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "eiyah-doctor-missing-command-{}",
+            std::process::id()
+        ));
+        let mut issues = Vec::new();
+        diagnose_installation(&home, &mut issues);
+        assert_eq!(
+            issues,
+            [format!(
+                "Eiyah installation information could not be read: Eiyah command was not found at {}",
+                home.join(".local/bin/eiyah").display()
+            )]
+        );
+        Ok(())
     }
 
     #[test]

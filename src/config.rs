@@ -663,7 +663,7 @@ pub fn is_show_cad_status_enabled(config_path: &Path) -> Result<bool> {
 /// installed pathと取得可能なruntime情報を収集する
 pub fn collect_system_config() -> Result<SystemConfig> {
     let home = runtime_home()?;
-    let paths = load_installed_paths_from_home(&home)?;
+    let paths = load_installed_paths_for_ui_from_home(&home)?;
 
     Ok(SystemConfig {
         eiyah_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -702,6 +702,67 @@ pub(crate) fn load_installed_paths_from_home(home: &Path) -> Result<ResolvedPath
     let public_entry = home.join(".local/bin/eiyah");
     let metadata_path = discover_install_metadata(&public_entry)?;
     ResolvedPaths::from_install_metadata(load_install_metadata(&metadata_path)?)
+}
+
+// config / doctor用にinstallation path recovery failureを利用者向けへ変換する
+pub(crate) fn load_installed_paths_for_ui_from_home(home: &Path) -> Result<ResolvedPaths> {
+    let public_entry = home.join(".local/bin/eiyah");
+    let metadata_path = discover_install_metadata(&public_entry).map_err(|error| {
+        let detail = match fs::symlink_metadata(&public_entry) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                format!("Eiyah command was not found at {}", public_entry.display())
+            }
+            Err(error) => format!(
+                "Eiyah command could not be read at {}: {error}",
+                public_entry.display()
+            ),
+            Ok(metadata) if !metadata.file_type().is_symlink() => {
+                format!("Eiyah command is invalid at {}", public_entry.display())
+            }
+            Ok(_) => match underlying_io_error(&error) {
+                Some(error) => format!(
+                    "Eiyah command could not be read at {}: {error}",
+                    public_entry.display()
+                ),
+                None => format!("Eiyah command is invalid at {}", public_entry.display()),
+            },
+        };
+        installation_information_error(&detail)
+    })?;
+    let metadata = load_install_metadata(&metadata_path).map_err(|error| {
+        let detail = match underlying_io_error(&error) {
+            Some(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                format!("could not read {}: {error}", metadata_path.display())
+            }
+            _ => format!(
+                "Eiyah installation information is missing or invalid at {}",
+                metadata_path.display()
+            ),
+        };
+        installation_information_error(&detail)
+    })?;
+    ResolvedPaths::from_install_metadata(metadata).map_err(|_| {
+        installation_information_error(&format!(
+            "Eiyah installation paths are invalid at {}",
+            metadata_path.display()
+        ))
+    })
+}
+
+// user-facing detailへ残す基礎I/O errorをerror chainから取得する
+fn underlying_io_error(error: &anyhow::Error) -> Option<&io::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+}
+
+// installation path recoveryの共通user-facing Errorを構成する
+fn installation_information_error(detail: &str) -> anyhow::Error {
+    anyhow::Error::new(crate::ui::UserFacingError::new(
+        format!("Eiyah installation information could not be read: {detail}"),
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 /// runtime operationに必要なabsolute `HOME`を取得する
@@ -1290,6 +1351,90 @@ mod tests {
         assert!(!error.to_string().contains("temporary"));
         assert!(!error.to_string().contains("atomic"));
         assert!(load_config(&paths.eiyah_config)?.show_cad_status);
+        Ok(())
+    }
+
+    #[test]
+    // config path recoveryでmissing commandを利用者向けErrorへ変換する
+    fn reports_missing_eiyah_command_for_config_recovery() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/eiyah");
+        let error = load_installed_paths_for_ui_from_home(&home).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Eiyah installation information could not be read: Eiyah command was not found at {}",
+                entry.display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    // invalid commandとmissing installation informationも内部path用語なしで報告する
+    fn reports_other_installation_recovery_failures() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/eiyah");
+        fs::create_dir_all(entry.parent().unwrap())?;
+        fs::write(&entry, b"not a command link")?;
+        assert_eq!(
+            load_installed_paths_for_ui_from_home(&home)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Eiyah installation information could not be read: Eiyah command is invalid at {}",
+                entry.display()
+            )
+        );
+
+        fs::remove_file(&entry)?;
+        let binary = directory.path.join("prefix/bin/eiyah");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        symlink(&binary, &entry)?;
+        let metadata = directory.path.join("prefix/install.toml");
+        assert_eq!(
+            load_installed_paths_for_ui_from_home(&home)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Eiyah installation information could not be read: Eiyah installation information is missing or invalid at {}",
+                metadata.display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    // installation path recoveryのI/O failureで対象pathとOS errorを保持する
+    fn preserves_installation_recovery_io_error_details() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        let home = directory.path.join("home");
+        let entry = home.join(".local/bin/eiyah");
+        let entry_parent = entry.parent().unwrap();
+        fs::create_dir_all(entry_parent)?;
+        let binary = directory.path.join("prefix/bin/eiyah");
+        fs::create_dir_all(binary.parent().unwrap())?;
+        symlink(&binary, &entry)?;
+
+        fs::set_permissions(entry_parent, fs::Permissions::from_mode(0o000))?;
+        let entry_error = load_installed_paths_for_ui_from_home(&home).unwrap_err();
+        fs::set_permissions(entry_parent, fs::Permissions::from_mode(0o755))?;
+        assert!(entry_error.to_string().contains(&format!(
+            "Eiyah command could not be read at {}: Permission denied",
+            entry.display()
+        )));
+
+        let metadata = directory.path.join("prefix/install.toml");
+        fs::write(&metadata, b"unreadable")?;
+        fs::set_permissions(&metadata, fs::Permissions::from_mode(0o000))?;
+        let metadata_error = load_installed_paths_for_ui_from_home(&home).unwrap_err();
+        fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600))?;
+        assert!(metadata_error.to_string().contains(&format!(
+            "Eiyah installation information could not be read: could not read {}: Permission denied",
+            metadata.display()
+        )));
         Ok(())
     }
 
