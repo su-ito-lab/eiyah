@@ -1,0 +1,170 @@
+# ==================================================
+# @file .github/workflows/validation.yaml
+# @brief Public Eiyah validation workflow
+# ==================================================
+
+
+name: Eiyah validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+
+
+  # --------------------------------------------------
+  # Rust Validation
+  # --------------------------------------------------
+
+  rust-validation:
+    name: Rust validation
+    runs-on: ubuntu-latest
+    container: almalinux:8
+    steps:
+      - name: Install system dependencies
+        run: dnf install --assumeyes ca-certificates curl gcc git
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check Rust source
+        run: cargo check --locked
+      - name: Run Rust tests
+        run: cargo test --locked
+      - name: Check whitespace errors
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [[ $EVENT_NAME == pull_request ]]; then
+            git diff --check "$PULL_REQUEST_BASE_SHA...$PULL_REQUEST_HEAD_SHA"
+          elif git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+            git diff --check "$PUSH_BEFORE_SHA..$CURRENT_SHA"
+          else
+            # initial push等でbefore commitが利用できない場合は到達可能historyを検査する
+            while IFS= read -r commit; do
+              git diff-tree --check --root --no-commit-id -r "$commit"
+            done < <(git rev-list --reverse "$CURRENT_SHA")
+          fi
+
+
+  # --------------------------------------------------
+  # Bootstrap Validation
+  # --------------------------------------------------
+
+  bootstrap-validation:
+    name: Bootstrap validation
+    runs-on: ubuntu-latest
+    container: almalinux:8
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install --assumeyes ca-certificates curl epel-release git
+          dnf install --assumeyes ShellCheck
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Check shell syntax
+        shell: bash
+        run: >-
+          bash -n
+          install.sh
+          uninstall.sh
+          tests/bootstrap/install.sh
+          tests/bootstrap/uninstall.sh
+      - name: Run ShellCheck
+        shell: bash
+        run: >-
+          shellcheck
+          install.sh
+          uninstall.sh
+          tests/bootstrap/install.sh
+          tests/bootstrap/uninstall.sh
+      - name: Run installation bootstrap tests
+        shell: bash
+        run: bash tests/bootstrap/install.sh
+      - name: Run uninstallation bootstrap tests
+        shell: bash
+        run: bash tests/bootstrap/uninstall.sh
+
+
+  # --------------------------------------------------
+  # Compatibility Validation
+  # --------------------------------------------------
+
+  compatibility-validation:
+    name: Compatibility validation
+    runs-on: ubuntu-latest
+    container: almalinux:8
+    steps:
+      - name: Install system dependencies
+        run: dnf install --assumeyes ca-certificates curl gcc git jq
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Check compatibility baseline
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run release binary smoke test
+        shell: bash
+        run: |
+          binary=target/release/eiyah
+          test -f "$binary"
+          test -x "$binary"
+          version=$(cargo metadata --no-deps --format-version 1 | jq --raw-output '.packages[] | select(.name == "eiyah") | .version')
+          test -n "$version"
+          # sentinelでcommand substitutionによる末尾newline除去を防ぐ
+          actual_output=$(
+            "$binary" --version
+            status=$?
+            printf '\034'
+            exit "$status"
+          )
+          expected_output=$(printf 'eiyah %s\n\034' "$version")
+          test "$actual_output" = "$expected_output"
+
+
+  # --------------------------------------------------
+  # Validation Result Aggregation
+  # --------------------------------------------------
+
+  validation:
+    name: Validation
+    if: always()
+    needs:
+      - rust-validation
+      - bootstrap-validation
+      - compatibility-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check validation results
+        env:
+          RUST_RESULT: ${{ needs.rust-validation.result }}
+          BOOTSTRAP_RESULT: ${{ needs.bootstrap-validation.result }}
+          COMPATIBILITY_RESULT: ${{ needs.compatibility-validation.result }}
+        run: |
+          test "$RUST_RESULT" = success
+          test "$BOOTSTRAP_RESULT" = success
+          test "$COMPATIBILITY_RESULT" = success
